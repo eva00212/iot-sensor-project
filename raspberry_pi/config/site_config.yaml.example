@@ -1,0 +1,14 @@
+server:
+  host: "http://your-onem2m-server"
+  port: 8080
+  timeout: 10
+
+  headers:
+    X-M2M-Origin: "SmartFarmAE"
+    X-M2M-RI:     "rpi-collector"
+    Content-Type: "application/json;ty=4"
+    Accept:        "application/json"
+
+  retry:
+    max_attempts: 3
+    delay: 2

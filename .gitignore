@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Models (trained locally, not committed)
+raspberry_pi/models/
+
+# Logs
+raspberry_pi/logs/
+
+# Config secrets (copy from *.yaml.example)
+raspberry_pi/config/site_config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

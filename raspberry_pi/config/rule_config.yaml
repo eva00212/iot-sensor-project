@@ -1,0 +1,21 @@
+ranges:
+  temperature:     { min: -20,  max: 60   }
+  humidity:        { min: 0,    max: 100  }
+  co2:             { min: 0,    max: 5000 }
+  wind_speed:      { min: 0,    max: null }
+  solar_radiation: { min: 0,    max: null }
+
+sudden_change:
+  temperature:     5.0    # °C per interval
+  humidity:        10.0   # % per interval
+  co2:             300.0  # ppm per interval
+  wind_speed:      10.0   # m/s per interval
+  solar_radiation: 300.0  # W/m² per interval
+
+indoor_cross_check:
+  temperature: 5.0    # max allowed difference between indoor_01 and indoor_02
+  humidity:    15.0
+  co2:         300.0
+
+missing_data:
+  timeout_seconds: 60   # flag if no message received within this period

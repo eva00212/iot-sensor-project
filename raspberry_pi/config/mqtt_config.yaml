@@ -1,0 +1,12 @@
+broker:
+  host: "localhost"
+  port: 1883
+  keepalive: 60
+
+subscribe:
+  topic: "smartfarm/+/+/raw"
+  qos: 1
+
+client:
+  id: "rpi-collector"
+  reconnect_delay: 5        # seconds between reconnect attempts
