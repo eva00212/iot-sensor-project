@@ -200,7 +200,13 @@ void setup() {
     connectWifi();
 
     timeClient.begin();
-    timeClient.update();
+    Serial.print("[NTP] Syncing");
+    while (timeClient.getEpochTime() < 1000000000UL) {
+        timeClient.update();
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.println("done");
 
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 

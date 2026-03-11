@@ -28,7 +28,7 @@
 #define DEVICE_ID "indoor_01"
 
 // ── WiFi Config ───────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "area 1";
+const char* WIFI_SSID     = "area1";
 const char* WIFI_PASSWORD = "00000000";
 
 // ── MQTT Config ───────────────────────────────────────────────────────────────
@@ -131,7 +131,13 @@ void setup() {
     connectWifi();
 
     timeClient.begin();
-    timeClient.update();
+    Serial.print("[NTP] Syncing");
+    while (timeClient.getEpochTime() < 1000000000UL) {
+        timeClient.update();
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.println("done");
 
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
