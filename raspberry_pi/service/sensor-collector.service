@@ -1,0 +1,17 @@
+[Unit]
+Description=SmartFarm Sensor Collector
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/iot-sensor-project/raspberry_pi/src
+ExecStart=/usr/bin/python3 /home/pi/iot-sensor-project/raspberry_pi/src/mqtt_collector.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

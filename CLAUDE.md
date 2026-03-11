@@ -320,4 +320,4 @@ site_02 / outdoor_01
 - [ ] implement AI anomaly scoring module
 - [ ] finalize oneM2M payload format
 - [ ] implement server upload interface
-- [ ] register systemd service
+- [x] register systemd service
