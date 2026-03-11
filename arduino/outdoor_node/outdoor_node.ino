@@ -31,11 +31,11 @@
 #define DEVICE_ID "outdoor_01"
 
 // ── WiFi Config ───────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "your_ssid";
-const char* WIFI_PASSWORD = "your_password";
+const char* WIFI_SSID     = "area 1";
+const char* WIFI_PASSWORD = "00000000";
 
 // ── MQTT Config ───────────────────────────────────────────────────────────────
-const char* MQTT_BROKER = "192.168.1.100";  // Raspberry Pi local IP
+const char* MQTT_BROKER = "192.168.0.10";  // Raspberry Pi local IP
 const int   MQTT_PORT   = 1883;
 const char* MQTT_TOPIC  = "smartfarm/" SITE_ID "/" DEVICE_ID "/raw";
 
