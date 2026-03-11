@@ -5,9 +5,9 @@ Wants=mosquitto.service
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/iot-sensor-project/raspberry_pi/src
-ExecStart=/usr/bin/python3 /home/pi/iot-sensor-project/raspberry_pi/src/mqtt_collector.py
+User=collector1
+WorkingDirectory=/home/collector1/iot-sensor-project/raspberry_pi/src
+ExecStart=/home/collector1/iot-sensor-project/raspberry_pi/.venv/bin/python3 /home/collector1/iot-sensor-project/raspberry_pi/src/mqtt_collector.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
