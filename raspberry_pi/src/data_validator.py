@@ -26,13 +26,19 @@ COMMON_FIELDS = {
 }
 
 DEVICE_EXTRA_FIELDS = {
-    "indoor_01":  {"co2": (int, float)},
-    "indoor_02":  {"co2": (int, float)},
+    "indoor_01":  {},
+    "indoor_02":  {},
     "outdoor_01": {
-        "wind_speed":      (int, float),
         "rain_detected":   bool,
         "solar_radiation": (int, float),
     },
+}
+
+# Optional fields: validated only when present in the payload
+DEVICE_OPTIONAL_FIELDS = {
+    "indoor_01":  {"co2": (int, float)},
+    "indoor_02":  {"co2": (int, float)},
+    "outdoor_01": {"wind_speed": (int, float)},
 }
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
@@ -46,6 +52,16 @@ def _check_fields(payload: dict, fields: dict) -> None:
     for field, expected_type in fields.items():
         if field not in payload:
             raise ValidationError(f"Missing required field: '{field}'")
+        if not isinstance(payload[field], expected_type):
+            raise ValidationError(
+                f"Field '{field}' has wrong type: "
+                f"expected {expected_type}, got {type(payload[field]).__name__}"
+            )
+
+def _check_optional_fields(payload: dict, fields: dict) -> None:
+    for field, expected_type in fields.items():
+        if field not in payload:
+            continue
         if not isinstance(payload[field], expected_type):
             raise ValidationError(
                 f"Field '{field}' has wrong type: "
@@ -83,6 +99,9 @@ def validate(payload: dict) -> dict:
     if extra is None:
         raise ValidationError(f"Unknown device_id: '{device_id}'")
     _check_fields(payload, extra)
+
+    optional = DEVICE_OPTIONAL_FIELDS.get(device_id, {})
+    _check_optional_fields(payload, optional)
 
     return payload
 
