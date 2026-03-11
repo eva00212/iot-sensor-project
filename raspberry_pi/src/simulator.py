@@ -144,7 +144,7 @@ def main():
     cfg    = load_config()
     broker = cfg["broker"]
 
-    client = mqtt.Client(client_id="simulator")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="simulator")
     client.connect(broker["host"], broker["port"], broker["keepalive"])
     client.loop_start()
 

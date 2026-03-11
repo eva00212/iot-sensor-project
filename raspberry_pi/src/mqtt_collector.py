@@ -68,18 +68,18 @@ def process(payload: dict) -> None:
     server_uploader.upload(converted)
 
 # ── MQTT Callbacks ────────────────────────────────────────────────────────────
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         topic = userdata["topic"]
         qos   = userdata["qos"]
         client.subscribe(topic, qos)
         logger.info("Connected to broker. Subscribed to '%s' (QoS %d)", topic, qos)
     else:
-        logger.error("Connection failed with code %d", rc)
+        logger.error("Connection failed with code %s", reason_code)
 
-def on_disconnect(client, userdata, rc):
-    if rc != 0:
-        logger.warning("Unexpected disconnect (rc=%d). Will reconnect...", rc)
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    if reason_code != 0:
+        logger.warning("Unexpected disconnect (rc=%s). Will reconnect...", reason_code)
 
 def on_message(client, userdata, msg):
     try:
@@ -99,7 +99,7 @@ def main():
 
     userdata = {"topic": sub["topic"], "qos": sub["qos"]}
 
-    client = mqtt.Client(client_id=client_cfg["id"], userdata=userdata)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_cfg["id"], userdata=userdata)
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
