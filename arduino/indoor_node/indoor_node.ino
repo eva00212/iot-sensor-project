@@ -3,8 +3,9 @@
  * SmartFarm Indoor Sensor Node
  *
  * Board  : Arduino UNO R4 WiFi
- * Sensors: SHT40 (temperature, humidity)
- *          INA3221 ch1 (voltage – internal fault detection only)
+ * Sensors: SHT40    (temperature, humidity)       – I2C
+ *          INA3221  ch1 (voltage – internal fault detection only) – I2C
+ *          CM1106   (co2, UART Modbus)             – Serial1 D0/D1
  *
  * Libraries (install via Library Manager):
  *   - Adafruit SHT4x Library  (+ Adafruit BusIO)
@@ -38,6 +39,10 @@ const char* MQTT_TOPIC  = "smartfarm/" SITE_ID "/" DEVICE_ID "/raw";
 #define INA3221_CHANNEL 1
 #define VOLTAGE_MIN     4.5f   // below this threshold → device_fault
 
+// ── CM1106 CO2 Config ─────────────────────────────────────────────────────────
+#define CM1106_BAUD        9600
+#define CM1106_TIMEOUT_MS  1000
+
 // ── Publish Interval ─────────────────────────────────────────────────────────
 const unsigned long PUBLISH_INTERVAL_MS = 30000UL;
 
@@ -54,6 +59,41 @@ bool ina_ok    = false;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 unsigned long lastPublish = 0;
+
+// ── CM1106 CO2 Reader ─────────────────────────────────────────────────────────
+// Returns CO2 in ppm, or -1 on failure.
+// Protocol: send 4-byte command, receive 7-byte response over Serial1.
+int readCO2() {
+    while (Serial1.available()) Serial1.read();  // flush
+
+    uint8_t cmd[4] = {0x11, 0x01, 0x01, 0xED};
+    Serial1.write(cmd, 4);
+    Serial1.flush();
+
+    unsigned long start = millis();
+    while (Serial1.available() < 7) {
+        if (millis() - start > CM1106_TIMEOUT_MS) {
+            Serial.println("[CM1106] timeout");
+            return -1;
+        }
+    }
+
+    uint8_t resp[7];
+    Serial1.readBytes(resp, 7);
+
+    if (resp[0] != 0x16 || resp[1] != 0x05 || resp[2] != 0x01) {
+        Serial.println("[CM1106] invalid response");
+        return -1;
+    }
+
+    uint8_t cs = (0x100 - ((resp[1] + resp[2] + resp[3] + resp[4] + resp[5]) & 0xFF)) & 0xFF;
+    if (resp[6] != cs) {
+        Serial.println("[CM1106] checksum error");
+        return -1;
+    }
+
+    return ((uint16_t)resp[3] << 8) | resp[4];
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 void connectWifi() {
@@ -86,6 +126,7 @@ void connectMqtt() {
 void setup() {
     Serial.begin(115200);
     Wire.begin();
+    Serial1.begin(CM1106_BAUD);
     delay(2000);
 
     connectWifi();
@@ -132,6 +173,7 @@ void loop() {
         bool  fault       = false;
         float temperature = 0.0f;
         float humidity    = 0.0f;
+        int   co2         = 0;
 
         // Read SHT40
         if (sht40_ok) {
@@ -145,6 +187,14 @@ void loop() {
             }
         } else {
             fault = true;
+        }
+
+        // Read CM1106 CO2
+        int co2_raw = readCO2();
+        if (co2_raw < 0) {
+            fault = true;
+        } else {
+            co2 = co2_raw;
         }
 
         // Read INA3221 voltage (internal use only)
@@ -166,6 +216,7 @@ void loop() {
         doc["device_id"]    = DEVICE_ID;
         doc["temperature"]  = (float)(round(temperature * 10) / 10.0);
         doc["humidity"]     = (float)(round(humidity    * 10) / 10.0);
+        doc["co2"]          = co2;
         doc["device_fault"] = fault;
 
         char payload[256];
