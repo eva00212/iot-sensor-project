@@ -134,9 +134,9 @@ void setup() {
     timeClient.begin();
     Serial.print("[NTP] Syncing");
     while (timeClient.getEpochTime() < 1000000000UL) {
-        timeClient.update();
+        timeClient.forceUpdate();
         Serial.print(".");
-        delay(500);
+        delay(2000);
     }
     Serial.println("done");
 
