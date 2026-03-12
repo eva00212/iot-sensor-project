@@ -57,7 +57,7 @@ const unsigned long PUBLISH_INTERVAL_MS = 30000UL;
 
 // ── NTP (UTC+9, KST) ─────────────────────────────────────────────────────────
 WiFiUDP   ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 9 * 3600L);
+NTPClient timeClient(ntpUDP, "216.239.35.0", 9 * 3600L);  // Google NTP (IP, bypasses DNS)
 
 // ── MQTT / WiFi clients ───────────────────────────────────────────────────────
 WiFiClient   wifiClient;
