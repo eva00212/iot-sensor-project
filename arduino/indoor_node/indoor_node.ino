@@ -11,13 +11,10 @@
  *   - INA3221 by Rob Tillaart
  *   - PubSubClient by Nick O'Leary
  *   - ArduinoJson by Benoit Blanchon
- *   - NTPClient by Fabrice Weinberg
  */
 
 #include <Wire.h>
 #include <WiFiS3.h>
-#include <WiFiUdp.h>
-#include <NTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "Adafruit_SHT4x.h"
@@ -43,10 +40,6 @@ const char* MQTT_TOPIC  = "smartfarm/" SITE_ID "/" DEVICE_ID "/raw";
 
 // ── Publish Interval ─────────────────────────────────────────────────────────
 const unsigned long PUBLISH_INTERVAL_MS = 30000UL;
-
-// ── NTP (UTC+9, KST) ─────────────────────────────────────────────────────────
-WiFiUDP   ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 9 * 3600L);
 
 // ── MQTT / WiFi clients ───────────────────────────────────────────────────────
 WiFiClient   wifiClient;
@@ -89,40 +82,6 @@ void connectMqtt() {
     }
 }
 
-// Converts NTP epoch (already offset by UTC+9) to ISO 8601 string
-String epochToISO8601(unsigned long epoch) {
-    const uint8_t daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-
-    uint32_t days      = epoch / 86400UL;
-    uint32_t timeOfDay = epoch % 86400UL;
-    uint8_t  h = timeOfDay / 3600;
-    uint8_t  m = (timeOfDay % 3600) / 60;
-    uint8_t  s = timeOfDay % 60;
-
-    uint16_t year = 1970;
-    while (true) {
-        bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-        uint16_t diy = leap ? 366 : 365;
-        if (days < diy) break;
-        days -= diy;
-        year++;
-    }
-
-    bool    leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    uint8_t month = 1;
-    for (int i = 0; i < 12; i++) {
-        uint8_t dim = daysInMonth[i] + (i == 1 && leap ? 1 : 0);
-        if (days < dim) break;
-        days -= dim;
-        month++;
-    }
-    uint8_t day = days + 1;
-
-    char buf[20];
-    sprintf(buf, "%04d-%02d-%02dT%02d:%02d:%02d", year, month, day, h, m, s);
-    return String(buf);
-}
-
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -130,15 +89,6 @@ void setup() {
     delay(2000);
 
     connectWifi();
-
-    timeClient.begin();
-    Serial.print("[NTP] Syncing");
-    while (timeClient.getEpochTime() < 1000000000UL) {
-        timeClient.forceUpdate();
-        Serial.print(".");
-        delay(2000);
-    }
-    Serial.println("done");
 
     mqttClient.setBufferSize(512);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
@@ -210,11 +160,10 @@ void loop() {
         }
 
         // Build and publish JSON payload
-        timeClient.update();
+        // timestamp is omitted — Raspberry Pi injects it on receipt
         StaticJsonDocument<256> doc;
         doc["site_id"]      = SITE_ID;
         doc["device_id"]    = DEVICE_ID;
-        doc["timestamp"]    = epochToISO8601(timeClient.getEpochTime());
         doc["temperature"]  = (float)(round(temperature * 10) / 10.0);
         doc["humidity"]     = (float)(round(humidity    * 10) / 10.0);
         doc["device_fault"] = fault;

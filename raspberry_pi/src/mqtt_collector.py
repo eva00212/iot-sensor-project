@@ -11,6 +11,7 @@ Received messages are parsed and passed to the processing pipeline:
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
@@ -49,6 +50,7 @@ def process(payload: dict) -> None:
     """Entry point for the full processing pipeline."""
     site_id   = payload.get("site_id")
     device_id = payload.get("device_id")
+    payload.setdefault("timestamp", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
     logger.info("[%s / %s] received: %s", site_id, device_id, payload)
 
     validated = data_validator.safe_validate(payload)
