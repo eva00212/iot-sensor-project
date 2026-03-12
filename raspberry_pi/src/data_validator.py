@@ -11,7 +11,7 @@ Checks:
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def _check_timestamp(ts: str) -> None:
             f"Invalid timestamp format: '{ts}'. Expected '{TIMESTAMP_FORMAT}'"
         )
     now = datetime.now()
-    if dt > now:
+    if dt > now + timedelta(seconds=60):
         raise ValidationError(f"Timestamp is in the future: '{ts}'")
 
 # ── Public API ────────────────────────────────────────────────────────────────

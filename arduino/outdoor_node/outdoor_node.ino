@@ -31,7 +31,7 @@
 #define DEVICE_ID "outdoor_01"
 
 // ── WiFi Config ───────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "area 1";
+const char* WIFI_SSID     = "area1";
 const char* WIFI_PASSWORD = "00000000";
 
 // ── MQTT Config ───────────────────────────────────────────────────────────────
@@ -86,16 +86,13 @@ void connectWifi() {
 }
 
 void connectMqtt() {
-    while (!mqttClient.connected()) {
-        Serial.print("[MQTT] Connecting...");
-        if (mqttClient.connect(DEVICE_ID)) {
-            Serial.println("connected");
-        } else {
-            Serial.print("failed rc=");
-            Serial.print(mqttClient.state());
-            Serial.println(", retry in 5s");
-            delay(5000);
-        }
+    Serial.print("[MQTT] Connecting...");
+    if (mqttClient.connect(DEVICE_ID)) {
+        Serial.println("connected");
+    } else {
+        Serial.print("failed rc=");
+        Serial.print(mqttClient.state());
+        Serial.println(", retry in 5s");
     }
 }
 
@@ -208,6 +205,7 @@ void setup() {
     }
     Serial.println("done");
 
+    mqttClient.setBufferSize(512);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
     sht40_ok = sht4.begin();
@@ -237,7 +235,12 @@ void loop() {
     }
 
     if (!mqttClient.connected()) {
-        connectMqtt();
+        static unsigned long lastReconnectAttempt = 0;
+        if (millis() - lastReconnectAttempt >= 5000) {
+            lastReconnectAttempt = millis();
+            connectMqtt();
+        }
+        return;
     }
     mqttClient.loop();
 
