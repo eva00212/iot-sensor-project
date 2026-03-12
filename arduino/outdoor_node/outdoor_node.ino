@@ -81,6 +81,10 @@ void connectWifi() {
         delay(500);
         Serial.print(".");
     }
+    while (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+        delay(500);
+        Serial.print(".");
+    }
     Serial.print("\n[WiFi] Connected: ");
     Serial.println(WiFi.localIP());
 }
