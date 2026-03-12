@@ -81,7 +81,7 @@ void connectWifi() {
         delay(500);
         Serial.print(".");
     }
-    while (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+    while (WiFi.localIP().toString() == "0.0.0.0") {
         delay(500);
         Serial.print(".");
     }
