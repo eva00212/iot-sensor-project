@@ -10,6 +10,7 @@ Received messages are parsed and passed to the processing pipeline:
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,15 @@ def process(payload: dict) -> None:
     converted = onem2m_converter.convert(final)
     server_uploader.upload(converted)
 
+# ── Missing Data Scheduler ────────────────────────────────────────────────────
+def _missing_data_loop():
+    """Background thread: checks for silent devices every 30 seconds."""
+    while True:
+        time.sleep(30)
+        missing = anomaly_rules.check_missing_data()
+        for (site_id, device_id), flags in missing.items():
+            logger.warning("[%s / %s] %s", site_id, device_id, flags)
+
 # ── MQTT Callbacks ────────────────────────────────────────────────────────────
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
@@ -107,6 +117,9 @@ def main():
     client.on_message    = on_message
 
     reconnect_delay = client_cfg["reconnect_delay"]
+
+    threading.Thread(target=_missing_data_loop, daemon=True).start()
+    logger.info("Missing data scheduler started (interval: 30s)")
 
     while True:
         try:

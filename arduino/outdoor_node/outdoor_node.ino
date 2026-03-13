@@ -202,11 +202,11 @@ void loop() {
     if (millis() - lastPublish >= PUBLISH_INTERVAL_MS) {
         lastPublish = millis();
 
-        bool  fault          = false;
-        float temperature    = 0.0f;
-        float humidity       = 0.0f;
-        bool  rain_detected  = false;
-        float solar_radiation = 0.0f;
+        bool  fault           = false;
+        float temperature     = 0.0f;
+        float humidity        = 0.0f;
+        bool  rain_detected   = false;
+        float solar_radiation = -1.0f;  // -1.0 = not available
 
         // Read SHT40
         if (sht40_ok) {
@@ -242,7 +242,6 @@ void loop() {
         if (solar < 0.0f) {
             Serial.println("[SEN0640] read failed");
             fault = true;
-            solar_radiation = 0.0f;
         } else {
             solar_radiation = solar;
         }
@@ -256,7 +255,8 @@ void loop() {
         doc["temperature"]     = (float)(round(temperature     * 10) / 10.0);
         doc["humidity"]        = (float)(round(humidity        * 10) / 10.0);
         doc["rain_detected"]   = rain_detected;
-        doc["solar_radiation"] = (float)(round(solar_radiation * 10) / 10.0);
+        if (solar_radiation >= 0.0f)
+            doc["solar_radiation"] = (float)(round(solar_radiation * 10) / 10.0);
         doc["device_fault"]    = fault;
 
         char payload[300];
