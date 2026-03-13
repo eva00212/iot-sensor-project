@@ -173,7 +173,7 @@ void loop() {
         bool  fault       = false;
         float temperature = 0.0f;
         float humidity    = 0.0f;
-        int   co2         = 0;
+        int   co2         = -1;  // -1 = not available
 
         // Read SHT40
         if (sht40_ok) {
@@ -216,7 +216,7 @@ void loop() {
         doc["device_id"]    = DEVICE_ID;
         doc["temperature"]  = (float)(round(temperature * 10) / 10.0);
         doc["humidity"]     = (float)(round(humidity    * 10) / 10.0);
-        doc["co2"]          = co2;
+        if (co2 >= 0) doc["co2"] = co2;
         doc["device_fault"] = fault;
 
         char payload[256];
