@@ -7,7 +7,7 @@
  *          INA3221 ch1  (voltage – internal fault detection only) – I2C
  *          NS-RSRM      (rain_detected)                – Digital D2
  *          SEN0640      (solar_radiation, RS485 Modbus RTU) – Serial1
- *          SEN0170      (wind_speed) – TODO: not connected yet
+ *          SEN0170      (wind_speed, analog A0)
  *
  * Libraries (install via Library Manager):
  *   - Adafruit SHT4x Library  (+ Adafruit BusIO)
@@ -51,6 +51,7 @@ char        mqttTopic[64] = "";
 
 // ── Pin Config ────────────────────────────────────────────────────────────────
 #define RAIN_PIN 2   // NS-RSRM OUT → D2
+#define WIND_PIN A0  // SEN0170 OUT → A0
 
 // ── Sensor Config ─────────────────────────────────────────────────────────────
 #define INA3221_ADDR    0x40
@@ -162,6 +163,16 @@ uint16_t crc16(uint8_t* buf, uint16_t len) {
     return crc;
 }
 
+// ── SEN0170 Wind Speed (Analog) ───────────────────────────────────────────────
+// Output: 0.4V (0 m/s) ~ 2.0V (32.4 m/s), ADC ref 3.3V, 10-bit
+// Returns wind speed in m/s (>= 0)
+float readWindSpeed() {
+    int   raw     = analogRead(WIND_PIN);
+    float voltage = raw * (3.3f / 1023.0f);
+    float speed   = (voltage - 0.4f) * (32.4f / 1.6f);
+    return max(speed, 0.0f);
+}
+
 // ── SEN0640 Solar Radiation (Modbus RTU over RS485) ───────────────────────────
 // Returns solar radiation in W/m², or -1.0 on failure
 float readSolarRadiation() {
@@ -252,6 +263,7 @@ void setup() {
 
     Serial.println("[RS485] Serial1 ready");
     Serial.println("[RAIN] pin ready");
+    Serial.println("[SEN0170] analog pin ready");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -279,6 +291,7 @@ void loop() {
         float temperature     = 0.0f;
         float humidity        = 0.0f;
         bool  rain_detected   = false;
+        float wind_speed      = 0.0f;
         float solar_radiation = -1.0f;  // -1.0 = not available
 
         // Read SHT40
@@ -310,6 +323,9 @@ void loop() {
         // Read rain sensor (LOW = rain detected)
         rain_detected = (digitalRead(RAIN_PIN) == LOW);
 
+        // Read wind speed via analog
+        wind_speed = readWindSpeed();
+
         // Read solar radiation via RS485 Modbus
         float solar = readSolarRadiation();
         if (solar < 0.0f) {
@@ -321,12 +337,12 @@ void loop() {
 
         // Build and publish JSON payload
         // timestamp omitted — Raspberry Pi injects it on receipt
-        // wind_speed omitted — SEN0170 not connected yet
         StaticJsonDocument<300> doc;
         doc["site_id"]         = siteId;
         doc["device_id"]       = DEVICE_ID;
         doc["temperature"]     = (float)(round(temperature     * 10) / 10.0);
         doc["humidity"]        = (float)(round(humidity        * 10) / 10.0);
+        doc["wind_speed"]      = (float)(round(wind_speed      * 10) / 10.0);
         doc["rain_detected"]   = rain_detected;
         if (solar_radiation >= 0.0f)
             doc["solar_radiation"] = (float)(round(solar_radiation * 10) / 10.0);
