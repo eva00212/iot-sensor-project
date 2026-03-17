@@ -13,9 +13,9 @@ sudden_change:
   solar_radiation: 300.0  # W/m² per interval
 
 indoor_cross_check:
-  temperature: 5.0    # max allowed difference between indoor_01 and indoor_02
-  humidity:    15.0
-  co2:         300.0
+  temperature: 2.5    # max allowed difference between indoor_01 and indoor_02
+  humidity:    8.0
+  co2:         200.0
 
 missing_data:
   timeout_seconds: 60   # flag if no message received within this period

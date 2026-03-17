@@ -14,6 +14,10 @@
  *   - INA3221 by Rob Tillaart
  *   - PubSubClient by Nick O'Leary
  *   - ArduinoJson by Benoit Blanchon
+ *
+ * Site ID configuration (Serial commands):
+ *   SET_SITE:site_XX  – save site ID to EEPROM and restart
+ *   GET_SITE          – print current site ID
  */
 
 #include <Wire.h>
@@ -22,19 +26,28 @@
 #include <ArduinoJson.h>
 #include "Adafruit_SHT4x.h"
 #include <INA3221.h>
+#include <EEPROM.h>
 
-// ── Site / Device Config ──────────────────────────────────────────────────────
-#define SITE_ID   "site_01"
+// ── Device Config (fixed per firmware) ───────────────────────────────────────
 #define DEVICE_ID "outdoor_01"
+
+// ── EEPROM Layout ─────────────────────────────────────────────────────────────
+#define EEPROM_MAGIC_ADDR  0          // 1 byte  – 0xAB if initialized
+#define EEPROM_SITE_ADDR   1          // 16 bytes – site_id string
+#define EEPROM_MAGIC_VAL   0xAB
+#define SITE_ID_MAX_LEN    16
+
+// ── Site ID (loaded from EEPROM at boot) ──────────────────────────────────────
+char siteId[SITE_ID_MAX_LEN] = "";
 
 // ── WiFi Config ───────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "area1";
 const char* WIFI_PASSWORD = "00000000";
 
 // ── MQTT Config ───────────────────────────────────────────────────────────────
-const char* MQTT_BROKER = "192.168.0.10";  // Raspberry Pi local IP
+const char* MQTT_BROKER = "smartfarm.local";
 const int   MQTT_PORT   = 1883;
-const char* MQTT_TOPIC  = "smartfarm/" SITE_ID "/" DEVICE_ID "/raw";
+char        mqttTopic[64] = "";
 
 // ── Pin Config ────────────────────────────────────────────────────────────────
 #define RAIN_PIN 2   // NS-RSRM OUT → D2
@@ -65,6 +78,50 @@ bool ina_ok   = false;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 unsigned long lastPublish = 0;
+
+// ── EEPROM Helpers ────────────────────────────────────────────────────────────
+void loadSiteId() {
+    if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) return;
+    for (int i = 0; i < SITE_ID_MAX_LEN; i++) {
+        siteId[i] = EEPROM.read(EEPROM_SITE_ADDR + i);
+        if (siteId[i] == '\0') break;
+    }
+    siteId[SITE_ID_MAX_LEN - 1] = '\0';
+}
+
+void saveSiteId(const char* id) {
+    EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VAL);
+    for (int i = 0; i < SITE_ID_MAX_LEN; i++) {
+        EEPROM.write(EEPROM_SITE_ADDR + i, id[i]);
+        if (id[i] == '\0') break;
+    }
+}
+
+// ── Serial Config Handler ─────────────────────────────────────────────────────
+// Commands: SET_SITE:site_XX  |  GET_SITE
+void handleSerialConfig() {
+    if (!Serial.available()) return;
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("SET_SITE:")) {
+        String id = cmd.substring(9);
+        id.trim();
+        if (id.length() == 0 || id.length() >= SITE_ID_MAX_LEN) {
+            Serial.println("[CONFIG] Invalid site ID");
+            return;
+        }
+        id.toCharArray(siteId, SITE_ID_MAX_LEN);
+        saveSiteId(siteId);
+        Serial.print("[CONFIG] Site ID saved: ");
+        Serial.println(siteId);
+        Serial.println("[CONFIG] Restarting...");
+        delay(100);
+        NVIC_SystemReset();
+    } else if (cmd == "GET_SITE") {
+        Serial.print("[CONFIG] Site ID: ");
+        Serial.println(strlen(siteId) > 0 ? siteId : "(not set)");
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 void connectWifi() {
@@ -158,6 +215,21 @@ void setup() {
     pinMode(RAIN_PIN, INPUT);
     delay(2000);
 
+    // Load site ID from EEPROM; wait for Serial config if not set
+    loadSiteId();
+    if (strlen(siteId) == 0) {
+        Serial.println("[CONFIG] No site ID set. Send: SET_SITE:site_XX");
+        while (strlen(siteId) == 0) {
+            handleSerialConfig();
+            delay(100);
+        }
+    }
+    snprintf(mqttTopic, sizeof(mqttTopic), "smartfarm/%s/%s/raw", siteId, DEVICE_ID);
+    Serial.print("[CONFIG] Site ID: ");
+    Serial.println(siteId);
+    Serial.print("[CONFIG] Topic: ");
+    Serial.println(mqttTopic);
+
     connectWifi();
 
     mqttClient.setBufferSize(512);
@@ -198,6 +270,7 @@ void loop() {
         return;
     }
     mqttClient.loop();
+    handleSerialConfig();
 
     if (millis() - lastPublish >= PUBLISH_INTERVAL_MS) {
         lastPublish = millis();
@@ -250,7 +323,7 @@ void loop() {
         // timestamp omitted — Raspberry Pi injects it on receipt
         // wind_speed omitted — SEN0170 not connected yet
         StaticJsonDocument<300> doc;
-        doc["site_id"]         = SITE_ID;
+        doc["site_id"]         = siteId;
         doc["device_id"]       = DEVICE_ID;
         doc["temperature"]     = (float)(round(temperature     * 10) / 10.0);
         doc["humidity"]        = (float)(round(humidity        * 10) / 10.0);
@@ -262,7 +335,7 @@ void loop() {
         char payload[300];
         serializeJson(doc, payload);
 
-        if (mqttClient.publish(MQTT_TOPIC, payload)) {
+        if (mqttClient.publish(mqttTopic, payload)) {
             Serial.print("[MQTT] published: ");
             Serial.println(payload);
         } else {
