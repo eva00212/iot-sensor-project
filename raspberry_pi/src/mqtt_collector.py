@@ -79,6 +79,13 @@ def _missing_data_loop():
         for (site_id, device_id), flags in missing.items():
             logger.warning("[%s / %s] %s", site_id, device_id, flags)
 
+# ── Buffer Flush Scheduler ────────────────────────────────────────────────────
+def _buffer_flush_loop():
+    """Background thread: retries buffered payloads every 5 minutes."""
+    while True:
+        time.sleep(300)
+        server_uploader.flush_buffer()
+
 # ── MQTT Callbacks ────────────────────────────────────────────────────────────
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
@@ -120,6 +127,9 @@ def main():
 
     threading.Thread(target=_missing_data_loop, daemon=True).start()
     logger.info("Missing data scheduler started (interval: 30s)")
+
+    threading.Thread(target=_buffer_flush_loop, daemon=True).start()
+    logger.info("Buffer flush scheduler started (interval: 300s)")
 
     while True:
         try:
