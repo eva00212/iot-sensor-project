@@ -318,6 +318,6 @@ site_02 / outdoor_01
 - [ ] implement data validation module
 - [ ] define rule-based anomaly detection thresholds
 - [ ] implement AI anomaly scoring module
-- [ ] finalize oneM2M payload format
-- [ ] implement server upload interface
+- [x] finalize oneM2M payload format
+- [x] implement server upload interface
 - [x] register systemd service
