@@ -1,13 +1,10 @@
 server:
-  host: "http://your-onem2m-server"
-  port: 8080
-  timeout: 10
-
-  headers:
-    X-M2M-Origin: "SmartFarmAE"
-    X-M2M-RI:     "rpi-collector"
-    Content-Type: "application/json;ty=4"
-    Accept:        "application/json"
+  host: "mobius.asquare.re.kr"
+  port: 1883
+  keepalive: 60
+  client_id: "rpi-uploader"
+  qos: 1
+  reconnect_delay: 5
 
   retry:
     max_attempts: 3

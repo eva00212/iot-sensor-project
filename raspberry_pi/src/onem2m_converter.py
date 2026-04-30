@@ -1,26 +1,17 @@
 """
 onem2m_converter.py
 
-Converts the final payload into oneM2M contentInstance (cin) format
-before transmission to the server.
+Maps internal site/device IDs to oneM2M identifiers and builds
+the flat JSON payload + MQTT topic for server upload.
 
-⚠️  The exact structure will be finalized after server-side agreement.
-    Adjust RESOURCE_ROOT and the wrapper structure in convert() as needed.
+MQTT broker : mobius.asquare.re.kr:1883
+Topic format: /multisensing/{testBedXX}/{deviceXX}
 
-oneM2M resource path:
-  /<cse-base>/<ae-name>/<container>/<contentInstance>
-
-Container naming convention:
-  {site_id}-{device_id}
-
-Example converted output:
-{
-  "m2m:cin": {
-    "cnf": "application/json",
-    "lbl": ["site_01", "indoor_01"],
-    "con": "{...}"       ← final payload serialized as JSON string
-  }
-}
+ID mapping:
+  site_01 ~ site_08  →  testBed01 ~ testBed08
+  indoor_01           →  device01
+  indoor_02           →  device02
+  outdoor_01          →  device03
 """
 
 import json
@@ -28,51 +19,51 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-# These will be finalized after server-side agreement.
-CSE_BASE  = "id-in"          # CSE base name
-AE_NAME   = "smartfarm"      # Application Entity name
-CONTENT_FORMAT = "application/json"
+SITE_ID_MAP = {f"site_{i:02d}": f"testBed{i:02d}" for i in range(1, 9)}
 
-# ── Public API ────────────────────────────────────────────────────────────────
-def get_container_name(site_id: str, device_id: str) -> str:
-    """Returns the oneM2M container name for a given site and device."""
-    return f"{site_id}-{device_id}"
+DEVICE_ID_MAP = {
+    "indoor_01":  "device01",
+    "indoor_02":  "device02",
+    "outdoor_01": "device03",
+}
 
-
-def get_resource_path(site_id: str, device_id: str) -> str:
-    """Returns the full oneM2M resource path for a contentInstance."""
-    container = get_container_name(site_id, device_id)
-    return f"/{CSE_BASE}/{AE_NAME}/{container}"
+TOPIC_BASE = "/multisensing"
 
 
 def convert(final_payload: dict) -> dict:
     """
-    Wrap the final payload in oneM2M contentInstance format.
+    Convert the final internal payload to oneM2M MQTT format.
 
     Args:
         final_payload: Output of payload_builder.build()
 
     Returns a dict with:
-      - "resource_path": oneM2M target path for the POST request
-      - "body":          oneM2M cin body to send
+      - "topic": MQTT topic to publish to
+      - "body":  JSON string payload for the server
     """
-    site_id   = final_payload["site_id"]
-    device_id = final_payload["device_id"]
+    internal_site   = final_payload["site_id"]
+    internal_device = final_payload["device_id"]
 
-    resource_path = get_resource_path(site_id, device_id)
+    site_id   = SITE_ID_MAP.get(internal_site)
+    device_id = DEVICE_ID_MAP.get(internal_device)
+
+    if site_id is None:
+        raise ValueError(f"Unknown site_id: '{internal_site}'")
+    if device_id is None:
+        raise ValueError(f"Unknown device_id: '{internal_device}'")
+
+    topic = f"{TOPIC_BASE}/{site_id}/{device_id}"
 
     body = {
-        "m2m:cin": {
-            "cnf": CONTENT_FORMAT,
-            "lbl": [site_id, device_id],
-            "con": json.dumps(final_payload, ensure_ascii=False),
-        }
+        "site_id":   site_id,
+        "device_id": device_id,
+        "timestamp": final_payload["timestamp"],
+        **final_payload["data"],
     }
 
-    logger.debug("[%s / %s] oneM2M path: %s", site_id, device_id, resource_path)
+    logger.debug("[%s / %s] → topic: %s", internal_site, internal_device, topic)
 
     return {
-        "resource_path": resource_path,
-        "body":          body,
+        "topic": topic,
+        "body":  json.dumps(body, ensure_ascii=False),
     }

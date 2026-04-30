@@ -1,7 +1,7 @@
 """
 server_uploader.py
 
-Uploads the oneM2M-converted payload to the server via HTTP POST.
+Publishes payloads to the oneM2M MQTT broker (mobius.asquare.re.kr:1883).
 
 Reads connection settings from config/site_config.yaml.
 Retries on failure up to max_attempts. If all retries fail, the payload
@@ -14,8 +14,8 @@ import threading
 import time
 from pathlib import Path
 
-import requests
 import yaml
+from paho.mqtt import publish as mqtt_publish
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +26,21 @@ def _load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 
-_cfg = _load_config()
+_cfg    = _load_config()
+_server = _cfg["server"]
 
-_server  = _cfg["server"]
-BASE_URL = f"{_server['host']}:{_server['port']}"
-HEADERS  = _server["headers"]
-TIMEOUT  = _server["timeout"]
+HOST         = _server["host"]
+PORT         = _server["port"]
+KEEPALIVE    = _server.get("keepalive", 60)
+CLIENT_ID    = _server.get("client_id", "rpi-uploader")
+QOS          = _server.get("qos", 1)
 MAX_ATTEMPTS = _server["retry"]["max_attempts"]
 RETRY_DELAY  = _server["retry"]["delay"]
 
 # ── Buffer ────────────────────────────────────────────────────────────────────
-BUFFER_PATH = Path(__file__).parent.parent / "logs" / "buffer.jsonl"
+BUFFER_PATH  = Path(__file__).parent.parent / "logs" / "buffer.jsonl"
 _buffer_lock = threading.Lock()
+
 
 def _write_to_buffer(converted: dict) -> None:
     with _buffer_lock:
@@ -45,30 +48,32 @@ def _write_to_buffer(converted: dict) -> None:
             f.write(json.dumps(converted) + "\n")
     logger.warning("Payload buffered to %s", BUFFER_PATH)
 
-# ── Internal upload (single attempt) ─────────────────────────────────────────
+
 def _try_upload(converted: dict) -> bool:
-    resource_path = converted["resource_path"]
-    body          = converted["body"]
-    url           = f"{BASE_URL}{resource_path}"
+    topic = converted["topic"]
+    body  = converted["body"]
     try:
-        response = requests.post(url, json=body, headers=HEADERS, timeout=TIMEOUT)
-        if response.status_code in (200, 201):
-            logger.info("Uploaded to %s [%d]", url, response.status_code)
-            return True
-        logger.warning("Upload failed: HTTP %d — %s", response.status_code, response.text[:200])
-    except requests.exceptions.ConnectionError:
-        logger.warning("Upload failed: connection error to %s", url)
-    except requests.exceptions.Timeout:
-        logger.warning("Upload failed: timeout after %ds", TIMEOUT)
-    except requests.exceptions.RequestException as e:
-        logger.error("Upload error: %s", e)
-    return False
+        mqtt_publish.single(
+            topic,
+            payload=body,
+            hostname=HOST,
+            port=PORT,
+            keepalive=KEEPALIVE,
+            client_id=CLIENT_ID,
+            qos=QOS,
+        )
+        logger.info("Published to %s:%d %s", HOST, PORT, topic)
+        return True
+    except Exception as e:
+        logger.warning("Upload failed: %s", e)
+        return False
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def upload(converted: dict) -> bool:
     """
-    POST a oneM2M contentInstance to the server with retries.
-    On total failure, appends to buffer.jsonl instead of dropping.
+    Publish to the oneM2M MQTT broker with retries.
+    On total failure, appends to buffer.jsonl.
 
     Returns True on success, False if buffered.
     """
@@ -95,7 +100,7 @@ def flush_buffer() -> None:
 
     with _buffer_lock:
         lines = BUFFER_PATH.read_text().splitlines()
-        BUFFER_PATH.unlink()  # clear atomically before retrying
+        BUFFER_PATH.unlink()
 
     if not lines:
         return
