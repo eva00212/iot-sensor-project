@@ -290,7 +290,7 @@ void loop() {
         doc["temperature"]  = (float)(round(temperature * 10) / 10.0);
         doc["humidity"]     = (float)(round(humidity    * 10) / 10.0);
         if (co2 >= 0) doc["co2"] = co2;
-        doc["device_fault"] = fault;
+        doc["device_fault"] = fault ? "true" : "false";
 
         char payload[256];
         serializeJson(doc, payload);

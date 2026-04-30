@@ -22,14 +22,14 @@ COMMON_FIELDS = {
     "timestamp":    str,
     "temperature":  (int, float),
     "humidity":     (int, float),
-    "device_fault": bool,
+    "device_fault": str,
 }
 
 DEVICE_EXTRA_FIELDS = {
     "indoor_01":  {},
     "indoor_02":  {},
     "outdoor_01": {
-        "rain_detected": bool,
+        "rain_detected": str,
     },
 }
 

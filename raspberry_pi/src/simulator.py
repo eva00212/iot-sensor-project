@@ -87,7 +87,7 @@ def _make_payload(site_id, device_id, temperature, humidity, co2, device_fault=F
         "temperature":  temperature,
         "humidity":     humidity,
         "co2":          co2,
-        "device_fault": device_fault,
+        "device_fault": "true" if device_fault else "false",
     }
 
 def _generate_outdoor(site_id: str, inject_anomaly: bool) -> dict:
@@ -129,8 +129,8 @@ def _generate_outdoor(site_id: str, inject_anomaly: bool) -> dict:
         "humidity":        humidity,
         "wind_speed":      wind_speed,
         "solar_radiation": solar_radiation,
-        "rain_detected":   random.random() < 0.05,
-        "device_fault":    device_fault,
+        "rain_detected":   "true" if random.random() < 0.05 else "false",
+        "device_fault":    "true" if device_fault else "false",
     }
 
 # ── Main ──────────────────────────────────────────────────────────────────────

@@ -105,7 +105,7 @@ def _check_indoor_cross(site_id: str, flags: list) -> None:
             flags.append(_flag(field, "INDOOR_MISMATCH"))
 
 def _check_device_fault(payload: dict, flags: list) -> None:
-    if payload.get("device_fault") is True:
+    if payload.get("device_fault") == "true":
         flags.append("DEVICE_FAULT")
 
 def _update_state(payload: dict, key: tuple) -> None:

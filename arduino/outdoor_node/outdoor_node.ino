@@ -343,10 +343,10 @@ void loop() {
         doc["temperature"]     = (float)(round(temperature     * 10) / 10.0);
         doc["humidity"]        = (float)(round(humidity        * 10) / 10.0);
         doc["wind_speed"]      = (float)(round(wind_speed      * 10) / 10.0);
-        doc["rain_detected"]   = rain_detected;
+        doc["rain_detected"]   = rain_detected ? "true" : "false";
         if (solar_radiation >= 0.0f)
             doc["solar_radiation"] = (float)(round(solar_radiation * 10) / 10.0);
-        doc["device_fault"]    = fault;
+        doc["device_fault"]    = fault ? "true" : "false";
 
         char payload[300];
         serializeJson(doc, payload);
