@@ -35,12 +35,12 @@ MODEL_DIR.mkdir(exist_ok=True)
 
 # ── Fields used for scoring per device ───────────────────────────────────────
 SCORE_FIELDS = {
-    "indoor_01":  ["temperature", "humidity", "co2"],
-    "indoor_02":  ["temperature", "humidity", "co2"],
-    "outdoor_01": ["temperature", "humidity", "wind_speed", "solar_radiation"],
+    "device01": ["temperature", "humidity", "co2"],
+    "device02": ["temperature", "humidity", "co2"],
+    "device03": ["temperature", "humidity", "wind_speed", "solar_radiation"],
 }
 
-# ── In-memory state per (site_id, device_id) ─────────────────────────────────
+# ── In-memory state per (site_id, device_id) ──────────────────────────────────
 _buffers: dict[tuple, list[list[float]]] = {}   # raw sample buffer
 _models:  dict[tuple, IsolationForest]   = {}   # trained models
 _counts:  dict[tuple, int]               = {}   # samples seen since last train

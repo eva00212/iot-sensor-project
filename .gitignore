@@ -8,11 +8,17 @@ venv/
 # Models (trained locally, not committed)
 raspberry_pi/models/
 
-# Logs
+# Logs and runtime state (includes buffer.jsonl, the disk-buffered upload queue)
 raspberry_pi/logs/
 
-# Config secrets (copy from *.yaml.example)
+# Config secrets (copy from site_config.example.yaml)
 raspberry_pi/config/site_config.yaml
+
+# Local AI tool config (machine-specific, not project state)
+.claude/
+
+# Spreadsheet with real broker connection info — never commit this
+oneM2M mqtt 접속정보 및 topic 관리.xlsx
 
 # OS
 .DS_Store

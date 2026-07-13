@@ -1,0 +1,15 @@
+# RS485 Modbus RTU settings for the sensors wired directly to this
+# Raspberry Pi's RS485 interface. Register map and scaling factors are
+# defined in src/modbus_poller.py, not here — they're part of the sensor
+# parsing logic, not a deployment-time setting.
+
+serial_port: "/dev/serial0"
+baudrate: 4800
+bytesize: 8
+parity: "N"          # N, E, or O
+stopbits: 1
+timeout_seconds: 0.5  # response wait timeout per attempt
+max_retries: 3        # attempts per poll before giving up
+
+inter_poll_delay_ms: 200    # min. gap between polling different slaves
+poll_interval_ms: 30000     # how often to poll all 3 sensors

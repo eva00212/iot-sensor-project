@@ -1,35 +1,24 @@
 """
 simulator.py
 
-Simulates Arduino sensor nodes publishing MQTT messages.
-Use this to test the full pipeline without physical hardware.
-
-Publishes to:
-  smartfarm/{site_id}/{device_id}/raw
+Simulates RS485 Modbus sensor readings and feeds them straight into the
+processing pipeline (collector.process), without touching real hardware.
+There's no local MQTT broker to publish to anymore — the Pi polls the
+sensors directly — so this calls the pipeline in-process instead.
 
 Usage:
-  python src/simulator.py                        # default: site_01, all devices
-  python src/simulator.py --site site_02         # specific site
-  python src/simulator.py --interval 3           # publish every 3 seconds
-  python src/simulator.py --anomaly              # inject anomalies randomly
+  python src/simulator.py                        # default: testBed01, all devices
+  python src/simulator.py --site testBed02        # specific site
+  python src/simulator.py --interval 3            # run a cycle every 3 seconds
+  python src/simulator.py --anomaly               # inject anomalies randomly
 """
 
 import argparse
-import json
 import random
 import time
 from datetime import datetime
-from pathlib import Path
 
-import paho.mqtt.client as mqtt
-import yaml
-
-# ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "mqtt_config.yaml"
-
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+import collector
 
 # ── Baseline sensor ranges (normal operating values) ─────────────────────────
 NORMAL = {
@@ -92,7 +81,7 @@ def _make_payload(site_id, device_id, temperature, humidity, co2, device_fault=F
 
 def _generate_outdoor(site_id: str, inject_anomaly: bool) -> dict:
     ranges = NORMAL["outdoor"]
-    prev   = _prev.setdefault("outdoor_01", {
+    prev   = _prev.setdefault("device03", {
         "temperature":     random.uniform(*ranges["temperature"]),
         "humidity":        random.uniform(*ranges["humidity"]),
         "wind_speed":      random.uniform(*ranges["wind_speed"]),
@@ -116,14 +105,14 @@ def _generate_outdoor(site_id: str, inject_anomaly: bool) -> dict:
         elif anomaly_type == "fault":
             device_fault = True
 
-    _prev["outdoor_01"] = {
+    _prev["device03"] = {
         "temperature": temperature, "humidity": humidity,
         "wind_speed": wind_speed,   "solar_radiation": solar_radiation,
     }
 
     return {
         "site_id":         site_id,
-        "device_id":       "outdoor_01",
+        "device_id":       "device03",
         "timestamp":       datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "temperature":     temperature,
         "humidity":        humidity,
@@ -136,42 +125,31 @@ def _generate_outdoor(site_id: str, inject_anomaly: bool) -> dict:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="SmartFarm sensor simulator")
-    parser.add_argument("--site",     default="site_01", help="Site ID (default: site_01)")
-    parser.add_argument("--interval", type=float, default=5.0, help="Publish interval in seconds (default: 5)")
+    parser.add_argument("--site",     default="testBed01", help="Site ID (default: testBed01)")
+    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between cycles (default: 5)")
     parser.add_argument("--anomaly",  action="store_true", help="Randomly inject anomalies")
     args = parser.parse_args()
 
-    cfg    = load_config()
-    broker = cfg["broker"]
-
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="simulator")
-    client.connect(broker["host"], broker["port"], broker["keepalive"])
-    client.loop_start()
-
     print(f"Simulator started — site: {args.site}, interval: {args.interval}s, anomalies: {args.anomaly}")
-    print("Press Ctrl+C to stop.\n")
+    print("Feeding synthetic readings straight into the pipeline (no MQTT). Press Ctrl+C to stop.\n")
 
     try:
         while True:
             payloads = [
-                _generate_indoor("indoor_01", args.site, args.anomaly),
-                _generate_indoor("indoor_02", args.site, args.anomaly),
+                _generate_indoor("device01", args.site, args.anomaly),
+                _generate_indoor("device02", args.site, args.anomaly),
                 _generate_outdoor(args.site, args.anomaly),
             ]
 
             for payload in payloads:
-                device_id = payload["device_id"]
-                topic     = f"smartfarm/{args.site}/{device_id}/raw"
-                client.publish(topic, json.dumps(payload), qos=1)
-                print(f"[{payload['timestamp']}] {topic}")
-                print(f"  {json.dumps(payload, ensure_ascii=False)}\n")
+                print(f"[{payload['timestamp']}] {payload['site_id']} / {payload['device_id']}")
+                print(f"  {payload}\n")
+                collector.process(payload)
 
             time.sleep(args.interval)
 
     except KeyboardInterrupt:
         print("Simulator stopped.")
-        client.loop_stop()
-        client.disconnect()
 
 if __name__ == "__main__":
     main()

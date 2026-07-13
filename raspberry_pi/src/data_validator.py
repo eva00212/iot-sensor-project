@@ -26,18 +26,18 @@ COMMON_FIELDS = {
 }
 
 DEVICE_EXTRA_FIELDS = {
-    "indoor_01":  {},
-    "indoor_02":  {},
-    "outdoor_01": {
+    "device01": {},
+    "device02": {},
+    "device03": {
         "rain_detected": str,
     },
 }
 
 # Optional fields: validated only when present in the payload
 DEVICE_OPTIONAL_FIELDS = {
-    "indoor_01":  {"co2": (int, float)},
-    "indoor_02":  {"co2": (int, float)},
-    "outdoor_01": {"wind_speed": (int, float), "solar_radiation": (int, float)},
+    "device01": {"co2": (int, float)},
+    "device02": {"co2": (int, float)},
+    "device03": {"wind_speed": (int, float), "solar_radiation": (int, float)},
 }
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"

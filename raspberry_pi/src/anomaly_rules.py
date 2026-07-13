@@ -6,7 +6,7 @@ Rule-based anomaly detection. Runs on every validated payload.
 Checks (in order):
 1. Out-of-range values
 2. Sudden change from previous reading
-3. Cross-check between indoor_01 and indoor_02
+3. Cross-check between device01 and device02 (indoor nodes)
 4. Device fault flag
 5. Missing data timeout (call check_missing_data() on a scheduler)
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "rule_config.yaml"
 
 def _load_config() -> dict:
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 _cfg = _load_config()
@@ -41,20 +41,20 @@ MISSING_TIMEOUT = _cfg["missing_data"]["timeout_seconds"]
 
 # ── Fields checked per device ─────────────────────────────────────────────────
 RANGE_FIELDS = {
-    "indoor_01":  ["temperature", "humidity", "co2"],
-    "indoor_02":  ["temperature", "humidity", "co2"],
-    "outdoor_01": ["temperature", "humidity", "wind_speed", "solar_radiation"],
+    "device01": ["temperature", "humidity", "co2"],
+    "device02": ["temperature", "humidity", "co2"],
+    "device03": ["temperature", "humidity", "wind_speed", "solar_radiation"],
 }
 
 SUDDEN_FIELDS = {
-    "indoor_01":  ["temperature", "humidity", "co2"],
-    "indoor_02":  ["temperature", "humidity", "co2"],
-    "outdoor_01": ["temperature", "humidity", "wind_speed", "solar_radiation"],
+    "device01": ["temperature", "humidity", "co2"],
+    "device02": ["temperature", "humidity", "co2"],
+    "device03": ["temperature", "humidity", "wind_speed", "solar_radiation"],
 }
 
-INDOOR_DEVICES = ("indoor_01", "indoor_02")
+INDOOR_DEVICES = ("device01", "device02")
 
-# ── In-memory state (per site+device) ─────────────────────────────────────────
+# ── In-memory state (per site + device) ───────────────────────────────────────
 # key: (site_id, device_id)
 _last_values: dict[tuple, dict] = {}   # previous sensor readings
 _last_seen:   dict[tuple, float] = {}  # epoch time of last message
@@ -92,8 +92,8 @@ def _check_sudden_change(payload: dict, device_id: str, key: tuple, flags: list)
 
 def _check_indoor_cross(site_id: str, flags: list) -> None:
     site_data = _indoor_latest.get(site_id, {})
-    d1 = site_data.get("indoor_01")
-    d2 = site_data.get("indoor_02")
+    d1 = site_data.get("device01")
+    d2 = site_data.get("device02")
     if d1 is None or d2 is None:
         return
     for field, threshold in CROSS_CHECK.items():

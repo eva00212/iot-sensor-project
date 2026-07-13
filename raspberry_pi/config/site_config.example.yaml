@@ -1,0 +1,26 @@
+# This Pi's test bed identity (format: testBed01..testBed08). Every payload
+# this collector builds is stamped with this site_id.
+site_id: "testBed01"
+
+server:
+  host: "mobius.asquare.re.kr"   # hostname, not an IP — LTE/NAT means the Pi's
+                                  # own address can change, so the server must
+                                  # always be addressed by name
+  port: 1883
+  keepalive: 60
+  client_id: "rpi-uploader"      # actual client_id used is "<this>-<site_id>",
+                                  # auto-suffixed so multiple Pis never collide
+                                  # on the broker
+  qos: 1
+
+  # Persistent connection + reconnect backoff (paho reconnect_delay_set).
+  # Tolerates the LTE link being down for extended periods.
+  reconnect_delay: 5             # backoff minimum, in seconds
+  max_reconnect_delay: 120       # backoff ceiling, in seconds
+  publish_timeout_seconds: 5     # max wait for a publish to be confirmed (PUBACK)
+
+  # Disk-buffer retransmission (logs/buffer.jsonl), used whenever the LTE
+  # link is down or a publish isn't confirmed in time.
+  flush:
+    batch_size: 20               # max buffered messages retransmitted per pass
+    pacing_seconds: 1            # delay between each retransmission

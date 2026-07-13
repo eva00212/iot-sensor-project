@@ -6,8 +6,8 @@ rule-based anomaly results, and AI anomaly score.
 
 Output format (before oneM2M conversion):
 {
-  "site_id":   "site_01",
-  "device_id": "indoor_01",
+  "site_id":   "testBed01",
+  "device_id": "device01",
   "timestamp": "2026-03-10T12:10:21",
   "data": {
     "temperature": 24.6,
@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 # ── Fields included in the server payload per device ─────────────────────────
 SERVER_FIELDS = {
-    "indoor_01":  ["temperature", "humidity", "co2", "device_fault"],
-    "indoor_02":  ["temperature", "humidity", "co2", "device_fault"],
-    "outdoor_01": ["temperature", "humidity", "wind_speed", "rain_detected",
-                   "solar_radiation", "device_fault"],
+    "device01": ["temperature", "humidity", "co2", "device_fault"],
+    "device02": ["temperature", "humidity", "co2", "device_fault"],
+    "device03": ["temperature", "humidity", "wind_speed", "rain_detected",
+                 "solar_radiation", "device_fault"],
 }
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ def build(validated: dict, rule_result: dict, ai_result: dict) -> dict:
 
     fields = SERVER_FIELDS.get(device_id)
     if fields is None:
-        logger.error("[%s / %s] Unknown device_id — cannot build payload.", site_id, device_id)
+        logger.error("[%s / %s] Unknown device_id - cannot build payload.", site_id, device_id)
         raise ValueError(f"Unknown device_id: '{device_id}'")
 
     data = {field: validated[field] for field in fields if field in validated}

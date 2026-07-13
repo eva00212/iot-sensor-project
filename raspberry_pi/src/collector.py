@@ -1,22 +1,23 @@
 """
-mqtt_collector.py
+collector.py
 
-Subscribes to smartfarm/+/+/raw and receives raw sensor payloads
-from all indoor/outdoor nodes.
+Polls the 3 RS485 Modbus RTU sensors wired directly to this Raspberry Pi
+(via modbus_poller) and runs each reading through the processing pipeline:
+  data_validator → anomaly_rules → anomaly_ai → payload_builder →
+  onem2m_converter → server_uploader
 
-Received messages are parsed and passed to the processing pipeline:
-  data_validator → anomaly_rules → anomaly_ai → payload_builder → server_uploader
+server_uploader publishes the processed result to the oneM2M MQTT broker —
+that outbound upload is the only MQTT hop in this system.
 """
 
-import json
 import logging
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
-import paho.mqtt.client as mqtt
 import yaml
+
+import modbus_poller
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -33,13 +34,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "mqtt_config.yaml"
+MODBUS_CONFIG_PATH = Path(__file__).parent.parent / "config" / "modbus_config.yaml"
+SITE_CONFIG_PATH   = Path(__file__).parent.parent / "config" / "site_config.yaml"
 
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
+def load_config(path: Path) -> dict:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-# ── Pipeline placeholder (replace with real imports as modules are built) ─────
+_modbus_cfg = load_config(MODBUS_CONFIG_PATH)
+POLL_INTERVAL_SEC    = _modbus_cfg["poll_interval_ms"] / 1000
+INTER_POLL_DELAY_SEC = _modbus_cfg["inter_poll_delay_ms"] / 1000
+
+SITE_ID = load_config(SITE_CONFIG_PATH)["site_id"]
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
 import data_validator
 import anomaly_rules
 import anomaly_ai
@@ -51,8 +59,7 @@ def process(payload: dict) -> None:
     """Entry point for the full processing pipeline."""
     site_id   = payload.get("site_id")
     device_id = payload.get("device_id")
-    payload.setdefault("timestamp", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
-    logger.info("[%s / %s] received: %s", site_id, device_id, payload)
+    logger.info("[%s / %s] polled: %s", site_id, device_id, payload)
 
     validated = data_validator.safe_validate(payload)
     if validated is None:
@@ -86,44 +93,21 @@ def _buffer_flush_loop():
         time.sleep(300)
         server_uploader.flush_buffer()
 
-# ── MQTT Callbacks ────────────────────────────────────────────────────────────
-def on_connect(client, userdata, flags, reason_code, properties):
-    if reason_code == 0:
-        topic = userdata["topic"]
-        qos   = userdata["qos"]
-        client.subscribe(topic, qos)
-        logger.info("Connected to broker. Subscribed to '%s' (QoS %d)", topic, qos)
-    else:
-        logger.error("Connection failed with code %s", reason_code)
+# ── Polling Loop ───────────────────────────────────────────────────────────────
+def _poll_cycle(site_id: str) -> None:
+    """Sequentially polls device01, device02, device03 with a minimum gap
+    between each, running every reading through the processing pipeline."""
+    process(modbus_poller.poll_device01(site_id))
+    time.sleep(INTER_POLL_DELAY_SEC)
 
-def on_disconnect(client, userdata, flags, reason_code, properties):
-    if reason_code != 0:
-        logger.warning("Unexpected disconnect (rc=%s). Will reconnect...", reason_code)
+    process(modbus_poller.poll_device02(site_id))
+    time.sleep(INTER_POLL_DELAY_SEC)
 
-def on_message(client, userdata, msg):
-    try:
-        payload = json.loads(msg.payload.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error("Failed to parse message from '%s': %s", msg.topic, e)
-        return
-
-    process(payload)
+    process(modbus_poller.poll_device03(site_id))
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    cfg    = load_config()
-    broker = cfg["broker"]
-    sub    = cfg["subscribe"]
-    client_cfg = cfg["client"]
-
-    userdata = {"topic": sub["topic"], "qos": sub["qos"]}
-
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_cfg["id"], userdata=userdata)
-    client.on_connect    = on_connect
-    client.on_disconnect = on_disconnect
-    client.on_message    = on_message
-
-    reconnect_delay = client_cfg["reconnect_delay"]
+def main() -> None:
+    server_uploader.start()
 
     threading.Thread(target=_missing_data_loop, daemon=True).start()
     logger.info("Missing data scheduler started (interval: 30s)")
@@ -131,17 +115,20 @@ def main():
     threading.Thread(target=_buffer_flush_loop, daemon=True).start()
     logger.info("Buffer flush scheduler started (interval: 300s)")
 
-    while True:
-        try:
-            client.connect(broker["host"], broker["port"], broker["keepalive"])
-            client.loop_forever()
-        except ConnectionRefusedError:
-            logger.error("Broker not reachable. Retrying in %ds...", reconnect_delay)
-            time.sleep(reconnect_delay)
-        except KeyboardInterrupt:
-            logger.info("Shutting down collector.")
-            client.disconnect()
-            break
+    logger.info(
+        "Starting poll loop for site '%s' (interval: %.0fs, inter-device gap: %.0fms)",
+        SITE_ID, POLL_INTERVAL_SEC, INTER_POLL_DELAY_SEC * 1000,
+    )
+
+    try:
+        while True:
+            cycle_start = time.monotonic()
+            _poll_cycle(SITE_ID)
+            elapsed = time.monotonic() - cycle_start
+            time.sleep(max(0.0, POLL_INTERVAL_SEC - elapsed))
+    except KeyboardInterrupt:
+        logger.info("Shutting down collector.")
+        server_uploader.stop()
 
 if __name__ == "__main__":
     main()

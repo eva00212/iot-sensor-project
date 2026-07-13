@@ -1,13 +1,19 @@
 [Unit]
 Description=SmartFarm Sensor Collector
-After=network.target mosquitto.service
-Wants=mosquitto.service
+# The uplink is an LTE modem/router, which can take a while to come up (or
+# may not be up at all yet) at boot. Wants= (not Requires=) is deliberately
+# soft: this unit still starts even if network-online.target never reports
+# ready, and collector.py's own MQTT client (server_uploader.py) connects
+# asynchronously with its own reconnect backoff regardless.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=collector1
-WorkingDirectory=/home/collector1/iot-sensor-project/raspberry_pi/src
-ExecStart=/home/collector1/iot-sensor-project/raspberry_pi/.venv/bin/python3 /home/collector1/iot-sensor-project/raspberry_pi/src/mqtt_collector.py
+User=pi
+Group=dialout
+WorkingDirectory=/home/pi/iot-sensor-project/raspberry_pi/src
+ExecStart=/home/pi/iot-sensor-project/raspberry_pi/.venv/bin/python3 /home/pi/iot-sensor-project/raspberry_pi/src/collector.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
