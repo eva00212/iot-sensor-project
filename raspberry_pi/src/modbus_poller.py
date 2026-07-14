@@ -6,18 +6,27 @@ Pi's RS485 interface (device01 @ 0x01, device02 @ 0x02, device03 @ 0x03,
 all on one shared bus). There is no intermediate microcontroller — the Pi
 does the polling itself.
 
-device01/device02 and device03 are the same sensor family sharing one
-register table; each variant only populates the registers for the sensors
-it has installed:
-  device01/device02 (indoor, "CO2 variant"): registers 504-507
-  device03 (outdoor):                        registers 500-515
+The sensor is a small all-in-one ultrasonic weather station (manual:
+SN-*-FSXCS-N01) that exposes many measurements in one continuous register
+table (500-515); each physical unit only has the sensors installed that
+are relevant to its deployment:
+  device01/device02 (indoor, "CO2 variant"): humidity/temperature/CO2
+  device03 (outdoor): wind speed/humidity/temperature/rainfall/solar
 
-All reads use Modbus function code 0x03 (Read Holding Registers). CRC
-validation and RTU framing are handled internally by minimalmodbus;
-application-level retry/timeout handling is added on top.
+All reads use Modbus function code 0x03 (Read Holding Registers). Each
+read is deliberately narrow — matching exactly the register spans the
+manual's own worked examples demonstrate (single registers, or the
+humidity+temperature pair) — rather than one wide block read spanning
+unused registers, since the manual never demonstrates anything wider than
+a 2-register read. CRC validation and RTU framing are handled internally
+by minimalmodbus; application-level retry/timeout handling is added on
+top, with >=200ms spacing between successive reads to the same device per
+the manual's FAQ ("host polling interval and response wait time must both
+be set to at least 200ms").
 """
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -44,13 +53,18 @@ STOPBITS    = _cfg["stopbits"]
 TIMEOUT_SEC = _cfg["timeout_seconds"]
 MAX_RETRIES = _cfg["max_retries"]
 
+# Minimum spacing between successive reads to the same device, per the
+# manual's FAQ requirement (>=200ms). Reuses the same config value
+# collector.py uses for spacing between *different* devices.
+INTER_READ_DELAY_SEC = _cfg["inter_poll_delay_ms"] / 1000
+
 FUNCTION_CODE = 0x03  # Read Holding Registers, per sensor manual
 
 SLAVE_DEVICE01 = 1
 SLAVE_DEVICE02 = 2
 SLAVE_DEVICE03 = 3
 
-# ── Register map (confirmed from sensor manual) ───────────────────────────────
+# ── Register map (confirmed from sensor manual, worked examples verified) ─────
 REG_WIND_SPEED  = 500  # raw × 0.1 m/s
 REG_HUMIDITY    = 504  # raw × 0.1 %RH
 REG_TEMPERATURE = 505  # signed 16-bit (two's complement), raw × 0.1 °C
@@ -64,23 +78,15 @@ TEMPERATURE_SCALE = 0.1
 RAINFALL_SCALE    = 0.1
 SOLAR_SCALE       = 1.0
 
-# Indoor block: 504..507 (humidity, temperature, [unused 506], co2)
-INDOOR_REG_START = REG_HUMIDITY
-INDOOR_REG_COUNT = REG_CO2 - REG_HUMIDITY + 1
-INDOOR_OFF_HUMID = REG_HUMIDITY - INDOOR_REG_START
-INDOOR_OFF_TEMP  = REG_TEMPERATURE - INDOOR_REG_START
-INDOOR_OFF_CO2   = REG_CO2 - INDOOR_REG_START
-
-# Outdoor block: 500..515 (wind, ...unused..., humidity, temperature,
-# ...unused..., rainfall, ...unused..., solar) — one block read is simpler
-# and cheaper than 5 separate requests.
-OUTDOOR_REG_START = REG_WIND_SPEED
-OUTDOOR_REG_COUNT = REG_SOLAR - REG_WIND_SPEED + 1
-OUTDOOR_OFF_WIND  = REG_WIND_SPEED - OUTDOOR_REG_START
-OUTDOOR_OFF_HUMID = REG_HUMIDITY - OUTDOOR_REG_START
-OUTDOOR_OFF_TEMP  = REG_TEMPERATURE - OUTDOOR_REG_START
-OUTDOOR_OFF_RAIN  = REG_RAINFALL - OUTDOOR_REG_START
-OUTDOOR_OFF_SOLAR = REG_SOLAR - OUTDOOR_REG_START
+# Humidity+temperature are read together (they're adjacent, and this exact
+# pair-read is the manual's own worked example in section 4.4.3). Every
+# other value is its own single-register read — each individually matches
+# a manual worked example (wind speed) or stays a minimal, isolated read
+# rather than sweeping through unrelated registers.
+HUMID_TEMP_REG_START = REG_HUMIDITY
+HUMID_TEMP_REG_COUNT = REG_TEMPERATURE - REG_HUMIDITY + 1  # 2
+HT_OFF_HUMID = REG_HUMIDITY - HUMID_TEMP_REG_START     # 0
+HT_OFF_TEMP  = REG_TEMPERATURE - HUMID_TEMP_REG_START  # 1
 
 # ── Instruments (one per slave address) ────────────────────────────────────────
 # minimalmodbus shares one underlying serial connection across all
@@ -127,11 +133,11 @@ def _read_block(slave_addr: int, start_reg: int, count: int) -> list | None:
             return instrument.read_registers(start_reg, count, functioncode=FUNCTION_CODE)
         except (minimalmodbus.ModbusException, serial.SerialException, OSError) as e:
             logger.warning(
-                "[Modbus] slave 0x%02X attempt %d/%d: %s",
-                slave_addr, attempt, MAX_RETRIES, e,
+                "[Modbus] slave 0x%02X reg %d attempt %d/%d: %s",
+                slave_addr, start_reg, attempt, MAX_RETRIES, e,
             )
 
-    logger.error("[Modbus] slave 0x%02X: failed after %d attempts", slave_addr, MAX_RETRIES)
+    logger.error("[Modbus] slave 0x%02X reg %d: failed after %d attempts", slave_addr, start_reg, MAX_RETRIES)
     return None
 
 
@@ -147,8 +153,16 @@ def _now_iso() -> str:
 # ── Public API ────────────────────────────────────────────────────────────────
 def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls an indoor sensor (device01/device02); returns a payload dict
-    ready for data_validator.validate()."""
-    regs = _read_block(slave_addr, INDOOR_REG_START, INDOOR_REG_COUNT)
+    ready for data_validator.validate().
+
+    Two separate reads, each matching the manual's proven pattern:
+      1. registers 504-505 (humidity, temperature) — the manual's own
+         worked example (section 4.4.3)
+      2. register 507 (CO2) — single-register read
+    """
+    ht_regs = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
+    time.sleep(INTER_READ_DELAY_SEC)
+    co2_regs = _read_block(slave_addr, REG_CO2, 1)
 
     payload = {
         "site_id":   site_id,
@@ -156,23 +170,40 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
         "timestamp": _now_iso(),
     }
 
-    if regs is None:
-        payload["temperature"]  = 0.0
-        payload["humidity"]     = 0.0
-        payload["device_fault"] = "true"
-        return payload
+    if ht_regs is not None:
+        payload["temperature"] = round(_to_signed16(ht_regs[HT_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
+        payload["humidity"]    = round(ht_regs[HT_OFF_HUMID] * HUMIDITY_SCALE, 1)
+    else:
+        payload["temperature"] = 0.0
+        payload["humidity"]    = 0.0
 
-    payload["temperature"]  = round(_to_signed16(regs[INDOOR_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
-    payload["humidity"]     = round(regs[INDOOR_OFF_HUMID] * HUMIDITY_SCALE, 1)
-    payload["co2"]          = regs[INDOOR_OFF_CO2]
-    payload["device_fault"] = "false"
+    if co2_regs is not None:
+        payload["co2"] = co2_regs[0]
+
+    payload["device_fault"] = "false" if (ht_regs is not None and co2_regs is not None) else "true"
     return payload
 
 
 def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls the outdoor sensor (device03); returns a payload dict ready
-    for data_validator.validate()."""
-    regs = _read_block(slave_addr, OUTDOOR_REG_START, OUTDOOR_REG_COUNT)
+    for data_validator.validate().
+
+    Four separate reads, each matching the manual's proven pattern or a
+    minimal single-register read:
+      1. register 500 (wind speed) — the manual's own worked example
+         (section 4.4.1)
+      2. registers 504-505 (humidity, temperature) — the manual's own
+         worked example (section 4.4.3)
+      3. register 513 (rainfall)
+      4. register 515 (solar radiation)
+    """
+    wind_regs = _read_block(slave_addr, REG_WIND_SPEED, 1)
+    time.sleep(INTER_READ_DELAY_SEC)
+    ht_regs = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
+    time.sleep(INTER_READ_DELAY_SEC)
+    rain_regs = _read_block(slave_addr, REG_RAINFALL, 1)
+    time.sleep(INTER_READ_DELAY_SEC)
+    solar_regs = _read_block(slave_addr, REG_SOLAR, 1)
 
     payload = {
         "site_id":   site_id,
@@ -180,24 +211,31 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
         "timestamp": _now_iso(),
     }
 
-    if regs is None:
-        payload["temperature"]   = 0.0
-        payload["humidity"]      = 0.0
-        payload["rain_detected"] = "false"
-        payload["device_fault"]  = "true"
-        return payload
+    if ht_regs is not None:
+        payload["temperature"] = round(_to_signed16(ht_regs[HT_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
+        payload["humidity"]    = round(ht_regs[HT_OFF_HUMID] * HUMIDITY_SCALE, 1)
+    else:
+        payload["temperature"] = 0.0
+        payload["humidity"]    = 0.0
 
-    payload["temperature"] = round(_to_signed16(regs[OUTDOOR_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
-    payload["humidity"]    = round(regs[OUTDOOR_OFF_HUMID] * HUMIDITY_SCALE, 1)
-    payload["wind_speed"]  = round(regs[OUTDOOR_OFF_WIND] * WIND_SPEED_SCALE, 1)
+    if wind_regs is not None:
+        payload["wind_speed"] = round(wind_regs[0] * WIND_SPEED_SCALE, 1)
 
     # Register 513 reports a rainfall amount (mm), not a direct boolean
     # flag. rain_detected is derived: any nonzero rainfall this interval.
-    rainfall = regs[OUTDOOR_OFF_RAIN] * RAINFALL_SCALE
-    payload["rain_detected"] = "true" if rainfall > 0.0 else "false"
+    # rain_detected is a required field, so it always gets a value —
+    # "false" is the safe fallback if this particular read failed.
+    if rain_regs is not None:
+        rainfall = rain_regs[0] * RAINFALL_SCALE
+        payload["rain_detected"] = "true" if rainfall > 0.0 else "false"
+    else:
+        payload["rain_detected"] = "false"
 
-    payload["solar_radiation"] = round(regs[OUTDOOR_OFF_SOLAR] * SOLAR_SCALE, 1)
-    payload["device_fault"]    = "false"
+    if solar_regs is not None:
+        payload["solar_radiation"] = round(solar_regs[0] * SOLAR_SCALE, 1)
+
+    all_ok = all(r is not None for r in (wind_regs, ht_regs, rain_regs, solar_regs))
+    payload["device_fault"] = "false" if all_ok else "true"
     return payload
 
 

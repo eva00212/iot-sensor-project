@@ -14,7 +14,7 @@ Examples:
   python test_modbus_sensor.py --slave 0x02 --start-register 504 --count 4
   python test_modbus_sensor.py --port /dev/ttyUSB0 --slave 3 --start-register 500 --count 16 --baudrate 9600
   python test_modbus_sensor.py --raw-listen
-  python test_modbus_sensor.py --scan   # try slave 1-10 x {2400,4800,9600,19200} baud, register 505
+  python test_modbus_sensor.py --scan   # try slave 1-10 x {2400,4800,9600} baud, register 505
   python test_modbus_sensor.py --self-test    # no hardware -- verify frame bytes vs. the manual
   python test_modbus_sensor.py --raw-probe    # bypass minimalmodbus, send the manual's exact frame
   python test_modbus_sensor.py --rts-direction   # add to any mode above if DE/RE is wired to RTS
@@ -48,7 +48,9 @@ KNOWN_REGISTERS = {
 PARITY_MAP = {"N": serial.PARITY_NONE, "E": serial.PARITY_EVEN, "O": serial.PARITY_ODD}
 
 
-DEFAULT_SCAN_BAUDRATES = [2400, 4800, 9600, 19200]
+# Per the sensor manual (section 4.1), this device only supports 2400,
+# 4800, or 9600 bit/s -- 19200 is not a valid rate for it.
+DEFAULT_SCAN_BAUDRATES = [2400, 4800, 9600]
 DEFAULT_SCAN_SLAVES = "1-10"
 
 
@@ -257,8 +259,8 @@ Modbus framing:
   4. Baud rate / power
      - Confirm the sensor is powered and any DIP switches / configuration
        match 4800 8N1.
-     - Try other common baud rates (--baudrate 9600, 19200) in case the
-       manual's stated default doesn't match this specific unit.
+     - This sensor only supports 2400/4800/9600 per its manual -- try
+       --baudrate 2400 or 9600 in case it's not at the factory default.
   5. Bus topology
      - Confirm 120ohm termination resistors are present at both ends of
        the bus on longer cable runs, and that this sensor is actually on
@@ -269,8 +271,8 @@ Modbus framing:
 integrity or a framing mismatch, not a dead link:
   1. Baud rate / frame settings
      - A near-miss baud rate (e.g. sensor actually at 9600 vs script at
-       4800) often produces garbled-but-nonzero bytes. Try --baudrate
-       9600 or 19200.
+       4800) often produces garbled-but-nonzero bytes. This sensor only
+       supports 2400/4800/9600 -- try --baudrate 2400 or 9600.
      - Confirm parity/stopbits really match the sensor (try --parity E
        or --stopbits 2 if the manual is ambiguous).
   2. Signal integrity
