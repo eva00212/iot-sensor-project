@@ -6,31 +6,45 @@ Pi's RS485 interface (device01 @ 0x01, device02 @ 0x02, device03 @ 0x03,
 all on one shared bus). There is no intermediate microcontroller — the Pi
 does the polling itself.
 
-The sensor is a small all-in-one ultrasonic weather station (manual:
+The low-level Modbus RTU communication below (frame building, CRC16,
+serial port setup, buffer flushing, single 500-515 block read) is a direct
+port of rs485_weather_station.py's WeatherStationSensor, which was
+independently verified against this exact hardware. An earlier version of
+this file used the `minimalmodbus` library instead, with several narrow,
+separate register reads per device (e.g. 500, then 504-505, then 507,
+513, 515) rather than one full-block read -- every request timed out on
+real hardware with that approach, even though the raw-pyserial
+single-block-read approach here works. Do not reintroduce minimalmodbus or
+split this back into narrow reads without re-verifying against real
+hardware first.
+
+Sensor: small all-in-one ultrasonic weather station (manual:
 SN-*-FSXCS-N01) that exposes many measurements in one continuous register
 table (500-515); each physical unit only has the sensors installed that
 are relevant to its deployment:
   device01/device02 (indoor, "CO2 variant"): humidity/temperature/CO2
   device03 (outdoor): wind speed/humidity/temperature/rainfall/solar
+Every variant shares the same 16-register table, so every device is
+polled with the exact same single block read (function code 0x03,
+registers 500-515) -- the payload builder then extracts only the fields
+relevant to that device's variant.
 
-All reads use Modbus function code 0x03 (Read Holding Registers). Each
-read is deliberately narrow — matching exactly the register spans the
-manual's own worked examples demonstrate (single registers, or the
-humidity+temperature pair) — rather than one wide block read spanning
-unused registers, since the manual never demonstrates anything wider than
-a 2-register read. CRC validation and RTU framing are handled internally
-by minimalmodbus; application-level retry/timeout handling is added on
-top, with >=200ms spacing between successive reads to the same device per
-the manual's FAQ ("host polling interval and response wait time must both
-be set to at least 200ms").
+Retry logic (modbus_retry_count attempts, modbus_retry_delay_seconds
+apart, both configurable and independent of the poll interval) wraps this
+block read. This is a resilience feature for the always-on collector
+service on top of the verified communication layer -- the reference
+rs485_weather_station.py script itself has no retries and simply reports
+a failed read on its next scheduled poll. Exhausting all retries is
+reported to the caller as (None, error_message), never raised: giving up
+on one reading must never stop the collector.
 """
 
 import logging
+import struct
 import time
 from datetime import datetime
 from pathlib import Path
 
-import minimalmodbus
 import serial
 import yaml
 
@@ -47,31 +61,25 @@ _cfg = _load_config()
 
 SERIAL_PORT = _cfg["serial_port"]
 BAUDRATE    = _cfg["baudrate"]
-BYTESIZE    = _cfg["bytesize"]
-PARITY      = _cfg["parity"]        # 'N', 'E', or 'O' — matches pyserial's PARITY_* constants
-STOPBITS    = _cfg["stopbits"]
+BYTESIZE    = _cfg["bytesize"]           # matches pyserial's *BITS constants (e.g. 8 == serial.EIGHTBITS)
+PARITY      = _cfg["parity"]             # 'N', 'E', or 'O' — matches pyserial's PARITY_* constants
+STOPBITS    = _cfg["stopbits"]           # matches pyserial's STOPBITS_* constants (e.g. 1 == serial.STOPBITS_ONE)
 TIMEOUT_SEC = _cfg["timeout_seconds"]
 
-# Retry behavior for a single register-block read. Independent of the poll
-# interval (collector.py's POLL_INTERVAL_SEC) by design -- this is the same
-# whether polling every 10s or every 600s. Exhausting all retries is
-# reported to the caller as (None, error_message), never raised: giving up
-# on one reading must never stop the collector.
-MAX_RETRIES      = _cfg["modbus_retry_count"]
-RETRY_DELAY_SEC  = _cfg["modbus_retry_delay_seconds"]
+MAX_RETRIES     = _cfg["modbus_retry_count"]
+RETRY_DELAY_SEC = _cfg["modbus_retry_delay_seconds"]
 
-# Minimum spacing between successive reads to the same device, per the
-# manual's FAQ requirement (>=200ms). Reuses the same config value
-# collector.py uses for spacing between *different* devices.
-INTER_READ_DELAY_SEC = _cfg["inter_poll_delay_ms"] / 1000
-
-FUNCTION_CODE = 0x03  # Read Holding Registers, per sensor manual
+READ_HOLDING_REGISTERS = 0x03  # the only function code this sensor supports, per its manual
 
 SLAVE_DEVICE01 = 1
 SLAVE_DEVICE02 = 2
 SLAVE_DEVICE03 = 3
 
-# ── Register map (confirmed from sensor manual, worked examples verified) ─────
+# ── Register map: one full block read (500-515) per poll, matching the
+# verified rs485_weather_station.py exactly ────────────────────────────────────
+FIRST_REGISTER = 500
+REGISTER_COUNT = 16  # covers 500..515 inclusive
+
 REG_WIND_SPEED  = 500  # raw × 0.1 m/s
 REG_HUMIDITY    = 504  # raw × 0.1 %RH
 REG_TEMPERATURE = 505  # signed 16-bit (two's complement), raw × 0.1 °C
@@ -85,80 +93,139 @@ TEMPERATURE_SCALE = 0.1
 RAINFALL_SCALE    = 0.1
 SOLAR_SCALE       = 1.0
 
-# Humidity+temperature are read together (they're adjacent, and this exact
-# pair-read is the manual's own worked example in section 4.4.3). Every
-# other value is its own single-register read — each individually matches
-# a manual worked example (wind speed) or stays a minimal, isolated read
-# rather than sweeping through unrelated registers.
-HUMID_TEMP_REG_START = REG_HUMIDITY
-HUMID_TEMP_REG_COUNT = REG_TEMPERATURE - REG_HUMIDITY + 1  # 2
-HT_OFF_HUMID = REG_HUMIDITY - HUMID_TEMP_REG_START     # 0
-HT_OFF_TEMP  = REG_TEMPERATURE - HUMID_TEMP_REG_START  # 1
 
-# ── Instruments (one per slave address) ────────────────────────────────────────
-# minimalmodbus shares one underlying serial connection across all
-# Instrument objects opened on the same port string, so creating one
-# instrument per slave address is the correct way to poll several devices
-# on one shared RS485 bus.
-_instruments: dict[int, "minimalmodbus.Instrument"] = {}
+class ModbusError(Exception):
+    """Any Modbus RTU communication/framing failure (no/short response,
+    slave exception, unexpected header, CRC mismatch). Mirrors
+    rs485_weather_station.py's ModbusError."""
 
 
-def _get_instrument(slave_addr: int) -> "minimalmodbus.Instrument":
-    inst = _instruments.get(slave_addr)
-    if inst is not None:
-        return inst
-
-    inst = minimalmodbus.Instrument(SERIAL_PORT, slave_addr, mode=minimalmodbus.MODE_RTU)
-    inst.serial.baudrate = BAUDRATE
-    inst.serial.bytesize = BYTESIZE
-    inst.serial.parity   = PARITY
-    inst.serial.stopbits = STOPBITS
-    inst.serial.timeout  = TIMEOUT_SEC
-    inst.close_port_after_each_call = False
-
-    # The attached RS485 board auto-switches transmit/receive direction, so
-    # no manual DE/RE GPIO toggling is needed. If a future board requires
-    # it, pyserial's kernel-level RS485 mode is the robust way to add it:
-    #   import serial.rs485
-    #   inst.serial.rs485_mode = serial.rs485.RS485Settings()
-
-    _instruments[slave_addr] = inst
-    return inst
+def _crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
 
 
-def _read_block(slave_addr: int, start_reg: int, count: int) -> tuple[list | None, str | None]:
+def _build_request(slave_addr: int, start_addr: int, quantity: int) -> bytes:
+    body = struct.pack(">BBHH", slave_addr, READ_HOLDING_REGISTERS, start_addr, quantity)
+    crc = _crc16_modbus(body)
+    # CRC is sent low byte first, high byte second (per datasheet 4.2/4.4)
+    return body + struct.pack("<H", crc)
+
+
+# ── Serial port: one shared connection for the whole RS485 bus ────────────────
+# All three sensors share one physical bus/UART, so (like
+# rs485_weather_station.py's single self.ser) there is exactly one
+# serial.Serial instance here, not one per slave address.
+_ser: "serial.Serial | None" = None
+
+
+def _get_serial() -> "serial.Serial":
+    """Opens the shared serial port exactly once, with every setting
+    passed atomically to the serial.Serial() constructor -- matching
+    rs485_weather_station.py's WeatherStationSensor.__init__ exactly,
+    rather than opening with library defaults and reconfiguring
+    properties one at a time afterward."""
+    global _ser
+    if _ser is not None and _ser.is_open:
+        return _ser
+
+    _ser = serial.Serial(
+        port=SERIAL_PORT,
+        baudrate=BAUDRATE,
+        bytesize=BYTESIZE,
+        parity=PARITY,
+        stopbits=STOPBITS,
+        timeout=TIMEOUT_SEC,
+    )
+    return _ser
+
+
+def _read_registers_once(slave_addr: int, start_addr: int, quantity: int) -> list[int]:
+    """Single Modbus RTU transaction, no retries -- raises ModbusError on
+    any failure. Direct port of
+    rs485_weather_station.WeatherStationSensor.read_registers()."""
+    ser = _get_serial()
+    request = _build_request(slave_addr, start_addr, quantity)
+
+    ser.reset_input_buffer()
+    ser.write(request)
+    ser.flush()  # block until bytes are physically out, same as the verified script
+
+    expected_len = 3 + 2 * quantity + 2  # addr+func+bytecount+data+crc
+    response = ser.read(expected_len)
+
+    if len(response) < 5:
+        raise ModbusError(
+            f"No/short response from slave {slave_addr:#04x} "
+            f"({len(response)} bytes) -- check wiring/address/baud rate"
+        )
+
+    addr, func = response[0], response[1]
+
+    if func & 0x80:
+        raise ModbusError(
+            f"Slave {addr:#04x} returned exception code {response[2]:#04x} "
+            f"for function {func & 0x7F:#04x}"
+        )
+
+    if addr != slave_addr or func != READ_HOLDING_REGISTERS:
+        raise ModbusError(f"Unexpected response header: {response.hex()}")
+
+    byte_count = response[2]
+    if len(response) != 3 + byte_count + 2:
+        raise ModbusError(f"Incomplete frame: {response.hex()}")
+
+    payload, recv_crc = response[:-2], response[-2:]
+    calc_crc = _crc16_modbus(payload)
+    recv_crc_val = recv_crc[0] | (recv_crc[1] << 8)
+    if calc_crc != recv_crc_val:
+        raise ModbusError(
+            f"CRC mismatch: calculated {calc_crc:#06x}, "
+            f"received {recv_crc_val:#06x}, frame {response.hex()}"
+        )
+
+    data = payload[3:]
+    return [struct.unpack(">H", data[i:i + 2])[0] for i in range(0, len(data), 2)]
+
+
+def _read_block(slave_addr: int) -> tuple[list[int] | None, str | None]:
     """
-    Reads `count` holding registers starting at `start_reg` from
-    `slave_addr`, retrying up to MAX_RETRIES times with RETRY_DELAY_SEC
-    between attempts. CRC validation and framing are handled internally by
-    minimalmodbus. Returns (values, None) on success, or
-    (None, error_message) if every attempt failed -- this function never
-    raises for a communication failure, only for a programming error.
+    Reads the full 16-register block (500-515) from `slave_addr`, retrying
+    up to MAX_RETRIES times with RETRY_DELAY_SEC between attempts. Returns
+    (registers, None) on success, or (None, error_message) if every
+    attempt failed -- this function never raises for a communication
+    failure, only for a programming error.
 
-    Instrument acquisition (which opens the serial port on first use) is
-    inside the retry loop, not just the read itself: right after boot the
-    UART device node can briefly not exist yet, or a USB-RS485 adapter can
-    be transiently unavailable, and that failure must be retried exactly
-    like any other transient Modbus error rather than raising out of the
-    poll loop.
+    Serial port acquisition (which opens the port on first use) is inside
+    the retry loop, not just the read itself: right after boot the UART
+    device node can briefly not exist yet, or a USB-RS485 adapter can be
+    transiently unavailable, and that failure must be retried exactly like
+    any other transient Modbus error rather than raising out of the poll
+    loop.
     """
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            instrument = _get_instrument(slave_addr)
-            values = instrument.read_registers(start_reg, count, functioncode=FUNCTION_CODE)
+            values = _read_registers_once(slave_addr, FIRST_REGISTER, REGISTER_COUNT)
             return values, None
-        except (minimalmodbus.ModbusException, serial.SerialException, OSError) as e:
+        except (ModbusError, serial.SerialException, OSError) as e:
             last_error = e
             logger.warning(
-                "[Modbus] slave 0x%02X reg %d attempt %d/%d: %s",
-                slave_addr, start_reg, attempt, MAX_RETRIES, e,
+                "[Modbus] slave 0x%02X attempt %d/%d: %s",
+                slave_addr, attempt, MAX_RETRIES, e,
             )
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SEC)
 
-    message = f"slave 0x{slave_addr:02X} reg {start_reg}: {type(last_error).__name__}: {last_error}"
+    message = f"slave 0x{slave_addr:02X}: {type(last_error).__name__}: {last_error}"
     logger.error("[Modbus] %s (failed after %d attempts)", message, MAX_RETRIES)
     return None, message
 
@@ -172,19 +239,17 @@ def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _extract(regs: list[int], reg_addr: int) -> int:
+    return regs[reg_addr - FIRST_REGISTER]
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls an indoor sensor (device01/device02); returns a payload dict
-    ready for data_validator.validate().
-
-    Two separate reads, each matching the manual's proven pattern:
-      1. registers 504-505 (humidity, temperature) — the manual's own
-         worked example (section 4.4.3)
-      2. register 507 (CO2) — single-register read
-    """
-    ht_regs, ht_err = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
-    time.sleep(INTER_READ_DELAY_SEC)
-    co2_regs, co2_err = _read_block(slave_addr, REG_CO2, 1)
+    ready for data_validator.validate(). One block read of the full
+    500-515 register range -- all fields come from the same transaction,
+    so a failure means the whole reading falls back, not per-field."""
+    regs, error = _read_block(slave_addr)
 
     payload = {
         "site_id":   site_id,
@@ -192,43 +257,26 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
         "timestamp": _now_iso(),
     }
 
-    if ht_regs is not None:
-        payload["temperature"] = round(_to_signed16(ht_regs[HT_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
-        payload["humidity"]    = round(ht_regs[HT_OFF_HUMID] * HUMIDITY_SCALE, 1)
+    if regs is not None:
+        payload["temperature"]  = round(_to_signed16(_extract(regs, REG_TEMPERATURE)) * TEMPERATURE_SCALE, 1)
+        payload["humidity"]     = round(_extract(regs, REG_HUMIDITY) * HUMIDITY_SCALE, 1)
+        payload["co2"]          = _extract(regs, REG_CO2)
+        payload["device_fault"] = "false"
     else:
-        payload["temperature"] = 0.0
-        payload["humidity"]    = 0.0
+        payload["temperature"]   = 0.0
+        payload["humidity"]      = 0.0
+        payload["device_fault"]  = "true"
+        payload["error_message"] = error
 
-    if co2_regs is not None:
-        payload["co2"] = co2_regs[0]
-
-    errors = [e for e in (ht_err, co2_err) if e]
-    payload["device_fault"] = "true" if errors else "false"
-    if errors:
-        payload["error_message"] = "; ".join(errors)
     return payload
 
 
 def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls the outdoor sensor (device03); returns a payload dict ready
-    for data_validator.validate().
-
-    Four separate reads, each matching the manual's proven pattern or a
-    minimal single-register read:
-      1. register 500 (wind speed) — the manual's own worked example
-         (section 4.4.1)
-      2. registers 504-505 (humidity, temperature) — the manual's own
-         worked example (section 4.4.3)
-      3. register 513 (rainfall)
-      4. register 515 (solar radiation)
-    """
-    wind_regs, wind_err   = _read_block(slave_addr, REG_WIND_SPEED, 1)
-    time.sleep(INTER_READ_DELAY_SEC)
-    ht_regs, ht_err       = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
-    time.sleep(INTER_READ_DELAY_SEC)
-    rain_regs, rain_err   = _read_block(slave_addr, REG_RAINFALL, 1)
-    time.sleep(INTER_READ_DELAY_SEC)
-    solar_regs, solar_err = _read_block(slave_addr, REG_SOLAR, 1)
+    for data_validator.validate(). One block read of the full 500-515
+    register range -- all fields come from the same transaction, so a
+    failure means the whole reading falls back, not per-field."""
+    regs, error = _read_block(slave_addr)
 
     payload = {
         "site_id":   site_id,
@@ -236,33 +284,28 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
         "timestamp": _now_iso(),
     }
 
-    if ht_regs is not None:
-        payload["temperature"] = round(_to_signed16(ht_regs[HT_OFF_TEMP]) * TEMPERATURE_SCALE, 1)
-        payload["humidity"]    = round(ht_regs[HT_OFF_HUMID] * HUMIDITY_SCALE, 1)
-    else:
-        payload["temperature"] = 0.0
-        payload["humidity"]    = 0.0
+    if regs is not None:
+        payload["temperature"] = round(_to_signed16(_extract(regs, REG_TEMPERATURE)) * TEMPERATURE_SCALE, 1)
+        payload["humidity"]    = round(_extract(regs, REG_HUMIDITY) * HUMIDITY_SCALE, 1)
+        payload["wind_speed"]  = round(_extract(regs, REG_WIND_SPEED) * WIND_SPEED_SCALE, 1)
 
-    if wind_regs is not None:
-        payload["wind_speed"] = round(wind_regs[0] * WIND_SPEED_SCALE, 1)
-
-    # Register 513 reports a rainfall amount (mm), not a direct boolean
-    # flag. rain_detected is derived: any nonzero rainfall this interval.
-    # rain_detected is a required field, so it always gets a value —
-    # "false" is the safe fallback if this particular read failed.
-    if rain_regs is not None:
-        rainfall = rain_regs[0] * RAINFALL_SCALE
+        # Register 513 reports a rainfall amount (mm), not a direct
+        # boolean flag. rain_detected is derived: any nonzero rainfall
+        # this interval.
+        rainfall = _extract(regs, REG_RAINFALL) * RAINFALL_SCALE
         payload["rain_detected"] = "true" if rainfall > 0.0 else "false"
+
+        payload["solar_radiation"] = round(_extract(regs, REG_SOLAR) * SOLAR_SCALE, 1)
+        payload["device_fault"]    = "false"
     else:
+        payload["temperature"]   = 0.0
+        payload["humidity"]      = 0.0
+        # rain_detected is a required field, so it always gets a value --
+        # "false" is the safe fallback when the read failed.
         payload["rain_detected"] = "false"
+        payload["device_fault"]  = "true"
+        payload["error_message"] = error
 
-    if solar_regs is not None:
-        payload["solar_radiation"] = round(solar_regs[0] * SOLAR_SCALE, 1)
-
-    errors = [e for e in (wind_err, ht_err, rain_err, solar_err) if e]
-    payload["device_fault"] = "true" if errors else "false"
-    if errors:
-        payload["error_message"] = "; ".join(errors)
     return payload
 
 

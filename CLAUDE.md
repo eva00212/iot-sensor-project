@@ -5,7 +5,7 @@ A test-bed-based environmental monitoring system. Two indoor sensors and one out
 
 ## Tech Stack
 - Language: Python
-- Framework: paho-mqtt, minimalmodbus
+- Framework: paho-mqtt, pyserial (hand-rolled Modbus RTU in modbus_poller.py — see Modbus Register Map; minimalmodbus is only used by the standalone tools/test_modbus_sensor.py diagnostic script, not the collector)
 - Database: TBD (server side)
 - Edge Device: Raspberry Pi 5 (with an attached RS485 interface and an LTE modem/router for uplink)
 - Communication: RS485 Modbus RTU (sensors ↔ Pi), MQTT/oneM2M over LTE (Pi ↔ server)
@@ -178,16 +178,26 @@ poll interval is active instead of needing to be hand-tuned per environment.
 ## Modbus Register Map
 All three sensors are wired directly to the Raspberry Pi's RS485 interface
 over one shared bus (4800 baud, 8N1), each with its own Modbus slave
-address. `modbus_poller.py` polls every sensor with Modbus function code
-`0x03` (Read Holding Registers); CRC validation and RTU framing are handled
-by the `minimalmodbus` library, with application-level retry/timeout
-handling on top.
+address. `modbus_poller.py` polls **every** sensor — indoor or outdoor —
+with a single Modbus function-code-`0x03` (Read Holding Registers)
+transaction reading the full register block **500–515 (16 registers)**,
+then extracts only the fields relevant to that device's variant locally.
 
-| Slave addr | Device     | Registers read |
-|------------|------------|-----------------|
-| `0x01`     | `device01` | 504–507 |
-| `0x02`     | `device02` | 504–507 |
-| `0x03`     | `device03` | 500–515 |
+This is a hand-rolled Modbus RTU implementation (raw `pyserial` + manual
+CRC16/frame building — not the `minimalmodbus` library), ported directly
+from `rs485_weather_station.py`, which was independently verified against
+this exact hardware. An earlier version of `modbus_poller.py` used
+`minimalmodbus` with several *narrow* reads per device instead of one
+full-block read — every request timed out on real hardware with that
+approach. **Do not split this back into narrow per-field reads, and do not
+reintroduce minimalmodbus, without re-verifying against real hardware
+first.**
+
+| Slave addr | Device     | Registers read (every poll) |
+|------------|------------|-------------------------------|
+| `0x01`     | `device01` | 500–515 (full block; only 504/505/507 are used) |
+| `0x02`     | `device02` | 500–515 (full block; only 504/505/507 are used) |
+| `0x03`     | `device03` | 500–515 (full block; 500/504/505/513/515 are used) |
 
 | Register | Field | Scaling | Notes |
 |----------|-------|---------|-------|
@@ -200,8 +210,9 @@ handling on top.
 
 `device01`/`device02` and `device03` are the same sensor family sharing one
 register table — each variant only populates the registers for the sensors
-it has installed, so the board block-reads the full register span for its
-device type and only extracts the fields relevant to it.
+it has installed. Because it's a single transaction per poll, a Modbus
+failure now affects the whole reading (all fields fall back together),
+not individual fields.
 
 ## MQTT Topic Structure
 ```text
@@ -255,7 +266,7 @@ Sent when a register read exhausts all `modbus_retry_count` attempts;
   "temperature": 0.0,
   "humidity": 0.0,
   "device_fault": "true",
-  "error_message": "slave 0x01 reg 504: NoResponseError: no response from the slave"
+  "error_message": "slave 0x01: ModbusError: No/short response from slave 0x01 (0 bytes) -- check wiring/address/baud rate"
 }
 ```
 The collector keeps polling on its normal schedule after a fault — no

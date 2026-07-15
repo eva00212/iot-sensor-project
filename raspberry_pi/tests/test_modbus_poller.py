@@ -1,15 +1,24 @@
 """
 test_modbus_poller.py
 
-Unit tests for modbus_poller.py's pure logic (register offset math, signed
-conversion, scaling, rain_detected derivation, retry handling, and the
-per-field split-read pattern) using a mocked serial layer — no real RS485
-hardware or port required.
+Unit tests for modbus_poller.py's pure logic (CRC16, frame building,
+response parsing, register offset math, signed conversion, scaling,
+rain_detected derivation, retry handling, and the single-block-read
+strategy) using a mocked serial layer -- no real RS485 hardware or port
+required.
+
+modbus_poller.py's low-level Modbus RTU handling is a hand-rolled port of
+rs485_weather_station.py's WeatherStationSensor (raw pyserial + manual
+CRC16/framing, not the minimalmodbus library), verified working against
+real hardware. TestCrc16/TestBuildRequest lock in that the hand-rolled
+framing matches the sensor manual's own worked examples exactly, since
+there's no library to lean on for correctness anymore.
 
 Run with:
   python -m unittest discover raspberry_pi/tests
 """
 
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -18,6 +27,32 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import modbus_poller
+
+
+def _build_response(slave_addr: int, values: list[int]) -> bytes:
+    """Builds a valid Modbus RTU response frame for `values`, using the
+    module's own CRC so these tests stay correct even if framing details
+    change, as long as _read_registers_once's parsing is exercised
+    realistically."""
+    body = bytes([slave_addr, modbus_poller.READ_HOLDING_REGISTERS, 2 * len(values)])
+    for v in values:
+        body += struct.pack(">H", v & 0xFFFF)
+    crc = modbus_poller._crc16_modbus(body)
+    return body + struct.pack("<H", crc)
+
+
+def _full_block_registers(wind=14, humidity=654, temperature=251, co2=453, rainfall=0, solar=6536):
+    """Builds a 16-element register list (indices 0..15 == registers
+    500..515) with the given values at their real offsets and zero
+    elsewhere, matching what a real 500-515 block read returns."""
+    regs = [0] * modbus_poller.REGISTER_COUNT
+    regs[modbus_poller.REG_WIND_SPEED - modbus_poller.FIRST_REGISTER]  = wind & 0xFFFF
+    regs[modbus_poller.REG_HUMIDITY - modbus_poller.FIRST_REGISTER]    = humidity
+    regs[modbus_poller.REG_TEMPERATURE - modbus_poller.FIRST_REGISTER] = temperature & 0xFFFF
+    regs[modbus_poller.REG_CO2 - modbus_poller.FIRST_REGISTER]         = co2
+    regs[modbus_poller.REG_RAINFALL - modbus_poller.FIRST_REGISTER]    = rainfall
+    regs[modbus_poller.REG_SOLAR - modbus_poller.FIRST_REGISTER]       = solar
+    return regs
 
 
 class TestToSigned16(unittest.TestCase):
@@ -42,25 +77,164 @@ class TestToSigned16(unittest.TestCase):
         self.assertEqual(modbus_poller._to_signed16(0xFF9B), -101)
 
 
-class TestPollIndoor(unittest.TestCase):
-    """poll_indoor does two separate reads: registers 504-505
-    (humidity+temperature, the manual's own worked example) and register
-    507 (CO2) on its own."""
+class TestCrc16(unittest.TestCase):
+    def test_matches_manual_worked_example(self):
+        # Manual 4.4.1: query for wind speed at slave 0x01, start 0x01F4,
+        # qty 1 -> CRC 0xC4 0x04 (low byte first on the wire).
+        frame = bytes([0x01, 0x03, 0x01, 0xF4, 0x00, 0x01])
+        crc = modbus_poller._crc16_modbus(frame)
+        self.assertEqual(crc & 0xFF, 0xC4)
+        self.assertEqual((crc >> 8) & 0xFF, 0x04)
 
-    def _mock_read_block(self, ht=(654, 251), co2=453, ht_fail=False, co2_fail=False):
-        def fake(slave_addr, start_reg, count):
-            if start_reg == modbus_poller.HUMID_TEMP_REG_START:
-                self.assertEqual(count, 2)
-                return (None, "ht read failed") if ht_fail else (list(ht), None)
-            if start_reg == modbus_poller.REG_CO2:
-                self.assertEqual(count, 1)
-                return (None, "co2 read failed") if co2_fail else ([co2], None)
-            raise AssertionError(f"unexpected register read: start={start_reg} count={count}")
+
+class TestBuildRequest(unittest.TestCase):
+    """Verifies the hand-rolled frame building produces byte-identical
+    requests to the sensor manual's own worked examples -- the same
+    frames tools/test_modbus_sensor.py's --self-test checks minimalmodbus
+    against."""
+
+    def test_wind_speed_worked_example(self):
+        # Manual 4.4.1: slave 1, func 3, reg 500, count 1
+        expected = bytes.fromhex("01 03 01 F4 00 01 C4 04".replace(" ", ""))
+        self.assertEqual(modbus_poller._build_request(1, 500, 1), expected)
+
+    def test_humidity_temp_worked_example(self):
+        # Manual 4.4.3: slave 1, func 3, reg 504, count 2
+        expected = bytes.fromhex("01 03 01 F8 00 02 44 06".replace(" ", ""))
+        self.assertEqual(modbus_poller._build_request(1, 504, 2), expected)
+
+    def test_full_block_read_different_slave_addresses(self):
+        # Only the address byte and CRC should change across slaves;
+        # function code and register range stay the same for every device.
+        for slave in (1, 2, 3):
+            frame = modbus_poller._build_request(slave, 500, 16)
+            self.assertEqual(frame[0], slave)
+            self.assertEqual(frame[1], modbus_poller.READ_HOLDING_REGISTERS)
+
+
+class TestReadRegistersOnce(unittest.TestCase):
+    """Exercises _read_registers_once's response parsing against a fake
+    serial.Serial (via _get_serial), matching
+    rs485_weather_station.py's read_registers() logic exactly."""
+
+    def _fake_serial(self, response: bytes):
+        fake = MagicMock()
+        fake.is_open = True
+        fake.read.return_value = response
         return fake
 
-    def test_success(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block()), \
+    def test_success_full_block(self):
+        regs = _full_block_registers()
+        response = _build_response(1, regs)
+        fake = self._fake_serial(response)
+
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            result = modbus_poller._read_registers_once(1, modbus_poller.FIRST_REGISTER, modbus_poller.REGISTER_COUNT)
+
+        self.assertEqual(result, regs)
+        fake.reset_input_buffer.assert_called_once()
+        fake.flush.assert_called_once()
+        written = fake.write.call_args[0][0]
+        self.assertEqual(written, modbus_poller._build_request(1, modbus_poller.FIRST_REGISTER, modbus_poller.REGISTER_COUNT))
+
+    def test_short_response_raises(self):
+        fake = self._fake_serial(b"\x01\x03")  # far too short
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            with self.assertRaises(modbus_poller.ModbusError):
+                modbus_poller._read_registers_once(1, 500, 16)
+
+    def test_no_response_raises(self):
+        fake = self._fake_serial(b"")
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            with self.assertRaises(modbus_poller.ModbusError):
+                modbus_poller._read_registers_once(1, 500, 16)
+
+    def test_slave_exception_response_raises(self):
+        # Function code with the high bit set signals a Modbus exception;
+        # third byte is the exception code.
+        body = bytes([0x01, 0x03 | 0x80, 0x02])
+        crc = modbus_poller._crc16_modbus(body)
+        response = body + struct.pack("<H", crc)
+        fake = self._fake_serial(response)
+
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            with self.assertRaises(modbus_poller.ModbusError):
+                modbus_poller._read_registers_once(1, 500, 16)
+
+    def test_wrong_slave_address_in_response_raises(self):
+        response = _build_response(2, _full_block_registers())  # asked slave 1, got slave 2's reply
+        fake = self._fake_serial(response)
+
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            with self.assertRaises(modbus_poller.ModbusError):
+                modbus_poller._read_registers_once(1, 500, 16)
+
+    def test_crc_mismatch_raises(self):
+        response = bytearray(_build_response(1, _full_block_registers()))
+        response[-1] ^= 0xFF  # corrupt the CRC
+        fake = self._fake_serial(bytes(response))
+
+        with patch.object(modbus_poller, "_get_serial", return_value=fake):
+            with self.assertRaises(modbus_poller.ModbusError):
+                modbus_poller._read_registers_once(1, 500, 16)
+
+
+class TestReadBlockRetry(unittest.TestCase):
+    """_read_block returns (values, error_message) and sleeps
+    RETRY_DELAY_SEC between attempts -- time.sleep is mocked throughout so
+    these tests don't actually wait."""
+
+    def test_succeeds_after_transient_failures(self):
+        regs = _full_block_registers()
+        with patch.object(
+            modbus_poller, "_read_registers_once",
+            side_effect=[modbus_poller.ModbusError("no response"), regs],
+        ) as mock_read, \
+             patch.object(modbus_poller.time, "sleep") as mock_sleep:
+            values, error = modbus_poller._read_block(1)
+
+        self.assertEqual(values, regs)
+        self.assertIsNone(error)
+        self.assertEqual(mock_read.call_count, 2)
+        mock_sleep.assert_called_once_with(modbus_poller.RETRY_DELAY_SEC)
+
+    def test_returns_none_after_exhausting_retries(self):
+        with patch.object(
+            modbus_poller, "_read_registers_once",
+            side_effect=modbus_poller.ModbusError("CRC mismatch"),
+        ) as mock_read, \
+             patch.object(modbus_poller.time, "sleep") as mock_sleep:
+            values, error = modbus_poller._read_block(1)
+
+        self.assertIsNone(values)
+        self.assertIn("CRC mismatch", error)
+        self.assertEqual(mock_read.call_count, modbus_poller.MAX_RETRIES)
+        # One sleep between each pair of attempts, none after the last.
+        self.assertEqual(mock_sleep.call_count, modbus_poller.MAX_RETRIES - 1)
+
+    def test_retries_when_serial_port_acquisition_itself_fails(self):
+        # e.g. /dev/serial0 doesn't exist yet right after boot.
+        regs = _full_block_registers()
+        with patch.object(
+            modbus_poller, "_read_registers_once",
+            side_effect=[modbus_poller.serial.SerialException("port busy"), regs],
+        ) as mock_read, \
              patch.object(modbus_poller.time, "sleep"):
+            values, error = modbus_poller._read_block(1)
+
+        self.assertEqual(values, regs)
+        self.assertIsNone(error)
+        self.assertEqual(mock_read.call_count, 2)
+
+
+class TestPollIndoor(unittest.TestCase):
+    """poll_indoor now does exactly one block read (500-515) instead of
+    separate per-field reads -- success or failure applies to the whole
+    reading, not per field."""
+
+    def test_success(self):
+        regs = _full_block_registers(humidity=654, temperature=251, co2=453)
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
             payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
 
         self.assertEqual(payload["site_id"], "testBed01")
@@ -73,75 +247,37 @@ class TestPollIndoor(unittest.TestCase):
         self.assertIn("timestamp", payload)
 
     def test_negative_temperature(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(ht=(654, 0xFF9C))), \
-             patch.object(modbus_poller.time, "sleep"):
+        regs = _full_block_registers(temperature=0xFF9C)
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
             payload = modbus_poller.poll_indoor("testBed01", "device02", 2)
 
         self.assertEqual(payload["temperature"], -10.0)
 
-    def test_humid_temp_failure_uses_fallback_but_still_reads_co2(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(ht_fail=True)), \
-             patch.object(modbus_poller.time, "sleep"):
+    def test_read_failure_falls_back_and_reports_error(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(None, "no response from slave")):
             payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
 
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(payload["humidity"], 0.0)
-        self.assertEqual(payload["co2"], 453)  # co2 read is independent, still succeeded
-        self.assertEqual(payload["device_fault"], "true")
-        self.assertIn("ht read failed", payload["error_message"])
-
-    def test_co2_failure_omits_co2_but_keeps_humid_temp(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(co2_fail=True)), \
-             patch.object(modbus_poller.time, "sleep"):
-            payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
-
-        self.assertEqual(payload["temperature"], 25.1)
-        self.assertEqual(payload["humidity"], 65.4)
         self.assertNotIn("co2", payload)
-        self.assertEqual(payload["device_fault"], "true")  # any sub-read failing -> fault
-        self.assertIn("co2 read failed", payload["error_message"])
-
-    def test_both_reads_fail(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(ht_fail=True, co2_fail=True)), \
-             patch.object(modbus_poller.time, "sleep"):
-            payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
-
         self.assertEqual(payload["device_fault"], "true")
-        self.assertEqual(payload["temperature"], 0.0)
-        self.assertEqual(payload["humidity"], 0.0)
-        self.assertNotIn("co2", payload)
-        self.assertIn("ht read failed", payload["error_message"])
-        self.assertIn("co2 read failed", payload["error_message"])
+        self.assertEqual(payload["error_message"], "no response from slave")
+
+    def test_reads_full_block_starting_at_first_register(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None)) as mock_read:
+            modbus_poller.poll_indoor("testBed01", "device01", 1)
+
+        mock_read.assert_called_once_with(1)
 
 
 class TestPollOutdoor(unittest.TestCase):
-    """poll_outdoor does four separate reads: register 500 (wind speed,
-    the manual's worked example), registers 504-505 (humidity+temperature,
-    the manual's other worked example), register 513 (rainfall), and
-    register 515 (solar radiation) -- each independently, matching the
-    manual's proven pattern rather than one wide block read."""
-
-    def _mock_read_block(self, wind=14, ht=(614, 238), rain=0, solar=6536,
-                          wind_fail=False, ht_fail=False, rain_fail=False, solar_fail=False):
-        def fake(slave_addr, start_reg, count):
-            if start_reg == modbus_poller.REG_WIND_SPEED:
-                self.assertEqual(count, 1)
-                return (None, "wind read failed") if wind_fail else ([wind], None)
-            if start_reg == modbus_poller.HUMID_TEMP_REG_START:
-                self.assertEqual(count, 2)
-                return (None, "ht read failed") if ht_fail else (list(ht), None)
-            if start_reg == modbus_poller.REG_RAINFALL:
-                self.assertEqual(count, 1)
-                return (None, "rain read failed") if rain_fail else ([rain], None)
-            if start_reg == modbus_poller.REG_SOLAR:
-                self.assertEqual(count, 1)
-                return (None, "solar read failed") if solar_fail else ([solar], None)
-            raise AssertionError(f"unexpected register read: start={start_reg} count={count}")
-        return fake
+    """poll_outdoor now does exactly one block read (500-515) instead of
+    four separate reads -- success or failure applies to the whole
+    reading, not per field."""
 
     def test_success_no_rain(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(rain=0)), \
-             patch.object(modbus_poller.time, "sleep"):
+        regs = _full_block_registers(wind=14, humidity=614, temperature=238, rainfall=0, solar=6536)
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         self.assertEqual(payload["wind_speed"], 1.4)
@@ -150,21 +286,17 @@ class TestPollOutdoor(unittest.TestCase):
         self.assertEqual(payload["solar_radiation"], 6536.0)
         self.assertEqual(payload["rain_detected"], "false")
         self.assertEqual(payload["device_fault"], "false")
-        self.assertNotIn("rainfall", payload)
         self.assertNotIn("error_message", payload)
 
     def test_success_with_rain(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(rain=5)), \
-             patch.object(modbus_poller.time, "sleep"):
+        regs = _full_block_registers(rainfall=5)
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         self.assertEqual(payload["rain_detected"], "true")
-        self.assertNotIn("rainfall", payload)
 
-    def test_all_reads_fail(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(
-                wind_fail=True, ht_fail=True, rain_fail=True, solar_fail=True)), \
-             patch.object(modbus_poller.time, "sleep"):
+    def test_read_failure_falls_back_and_reports_error(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(None, "CRC mismatch")):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         self.assertEqual(payload["device_fault"], "true")
@@ -173,96 +305,13 @@ class TestPollOutdoor(unittest.TestCase):
         self.assertEqual(payload["rain_detected"], "false")
         self.assertNotIn("wind_speed", payload)
         self.assertNotIn("solar_radiation", payload)
-        for expected in ("wind read failed", "ht read failed", "rain read failed", "solar read failed"):
-            self.assertIn(expected, payload["error_message"])
+        self.assertEqual(payload["error_message"], "CRC mismatch")
 
-    def test_partial_failure_wind_only_still_reports_rest(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block(wind_fail=True)), \
-             patch.object(modbus_poller.time, "sleep"):
-            payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
-
-        self.assertNotIn("wind_speed", payload)
-        self.assertEqual(payload["temperature"], 23.8)
-        self.assertEqual(payload["humidity"], 61.4)
-        self.assertEqual(payload["solar_radiation"], 6536.0)
-        self.assertEqual(payload["device_fault"], "true")  # any sub-read failing -> fault
-        self.assertEqual(payload["error_message"], "wind read failed")
-
-    def test_inter_read_spacing_applied_between_each_sub_read(self):
-        with patch.object(modbus_poller, "_read_block", side_effect=self._mock_read_block()), \
-             patch.object(modbus_poller.time, "sleep") as mock_sleep:
+    def test_reads_full_block_starting_at_first_register(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None)) as mock_read:
             modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
-        # 4 reads -> 3 gaps between them
-        self.assertEqual(mock_sleep.call_count, 3)
-        for call in mock_sleep.call_args_list:
-            self.assertEqual(call.args[0], modbus_poller.INTER_READ_DELAY_SEC)
-
-
-class TestReadBlockRetry(unittest.TestCase):
-    """_read_block now returns (values, error_message) instead of a bare
-    list, and sleeps RETRY_DELAY_SEC between attempts -- time.sleep is
-    mocked throughout so these tests don't actually wait."""
-
-    def test_succeeds_after_transient_failures(self):
-        fake_instrument = MagicMock()
-        fake_instrument.read_registers.side_effect = [
-            modbus_poller.minimalmodbus.NoResponseError("timeout"),
-            [1, 2, 3, 4],
-        ]
-        with patch.object(modbus_poller, "_get_instrument", return_value=fake_instrument), \
-             patch.object(modbus_poller.time, "sleep") as mock_sleep:
-            values, error = modbus_poller._read_block(1, 504, 4)
-
-        self.assertEqual(values, [1, 2, 3, 4])
-        self.assertIsNone(error)
-        self.assertEqual(fake_instrument.read_registers.call_count, 2)
-        mock_sleep.assert_called_once_with(modbus_poller.RETRY_DELAY_SEC)
-
-    def test_returns_none_after_exhausting_retries(self):
-        fake_instrument = MagicMock()
-        fake_instrument.read_registers.side_effect = modbus_poller.minimalmodbus.InvalidResponseError("bad CRC")
-
-        with patch.object(modbus_poller, "_get_instrument", return_value=fake_instrument), \
-             patch.object(modbus_poller.time, "sleep") as mock_sleep:
-            values, error = modbus_poller._read_block(1, 504, 4)
-
-        self.assertIsNone(values)
-        self.assertIn("bad CRC", error)
-        self.assertEqual(fake_instrument.read_registers.call_count, modbus_poller.MAX_RETRIES)
-        # One sleep between each pair of attempts, none after the last.
-        self.assertEqual(mock_sleep.call_count, modbus_poller.MAX_RETRIES - 1)
-
-    def test_retries_when_instrument_acquisition_itself_fails(self):
-        # e.g. /dev/serial0 doesn't exist yet right after boot -- opening
-        # the port (inside _get_instrument) fails, not the read. This must
-        # be retried exactly like a failed read, not raise out of
-        # _read_block.
-        fake_instrument = MagicMock()
-        fake_instrument.read_registers.return_value = [1, 2, 3, 4]
-
-        with patch.object(
-            modbus_poller, "_get_instrument",
-            side_effect=[modbus_poller.serial.SerialException("port busy"), fake_instrument],
-        ) as mock_get, \
-             patch.object(modbus_poller.time, "sleep"):
-            values, error = modbus_poller._read_block(1, 504, 4)
-
-        self.assertEqual(values, [1, 2, 3, 4])
-        self.assertIsNone(error)
-        self.assertEqual(mock_get.call_count, 2)
-
-    def test_returns_none_when_instrument_acquisition_always_fails(self):
-        with patch.object(
-            modbus_poller, "_get_instrument",
-            side_effect=modbus_poller.serial.SerialException("no such device"),
-        ) as mock_get, \
-             patch.object(modbus_poller.time, "sleep"):
-            values, error = modbus_poller._read_block(1, 504, 4)
-
-        self.assertIsNone(values)
-        self.assertIn("no such device", error)
-        self.assertEqual(mock_get.call_count, modbus_poller.MAX_RETRIES)
+        mock_read.assert_called_once_with(3)
 
 
 if __name__ == "__main__":
