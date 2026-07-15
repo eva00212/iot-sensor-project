@@ -31,6 +31,14 @@ RETRAIN_EVERY     = 500     # retrain after this many new samples
 ANOMALY_THRESHOLD = 0.5     # ai_score >= this → "anomaly"
 CONTAMINATION     = 0.05    # expected anomaly ratio for IsolationForest
 
+# Sliding window: the buffer keeps at most this many of the most recent
+# samples per device. Without a cap it would grow forever over months of
+# 24/7 operation on a device with limited RAM; this still covers weeks of
+# history at the default 30s poll interval (~86400 samples ≈ 30 days),
+# which is enough for the model to track long-term drift without an
+# unbounded memory footprint.
+MAX_BUFFER_SAMPLES = 86400
+
 MODEL_DIR.mkdir(exist_ok=True)
 
 # ── Fields used for scoring per device ───────────────────────────────────────
@@ -116,8 +124,12 @@ def score(payload: dict) -> dict:
     if features is None:
         return {"ai_score": None, "ai_status": "pending"}
 
-    # Buffer the sample
-    _buffers.setdefault(key, []).append(features)
+    # Buffer the sample, trimming to the sliding window from the front
+    # (oldest first) so the buffer never grows past MAX_BUFFER_SAMPLES.
+    buf = _buffers.setdefault(key, [])
+    buf.append(features)
+    if len(buf) > MAX_BUFFER_SAMPLES:
+        del buf[: len(buf) - MAX_BUFFER_SAMPLES]
     _counts[key] = _counts.get(key, 0) + 1
 
     # Load model from disk on first encounter

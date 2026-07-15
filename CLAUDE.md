@@ -373,9 +373,9 @@ testBed02 / device03
 
 ## TODO
 - [x] implement Raspberry Pi Modbus RTU collector
-- [ ] implement data validation module
-- [ ] define rule-based anomaly detection thresholds
-- [ ] implement AI anomaly scoring module
+- [x] implement data validation module
+- [x] define rule-based anomaly detection thresholds
+- [x] implement AI anomaly scoring module
 - [x] finalize oneM2M payload format
 - [x] implement server upload interface
 - [x] register systemd service

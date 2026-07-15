@@ -13,7 +13,7 @@ Output format (before oneM2M conversion):
     "temperature": 24.6,
     "humidity":    63.2,
     "co2":         512,
-    "device_fault": false
+    "device_fault": "false"
   },
   "anomaly": {
     "rule_status": "normal",
@@ -22,9 +22,6 @@ Output format (before oneM2M conversion):
     "ai_status":   "normal"
   }
 }
-
-Note: voltage is excluded from the server payload.
-      It is used only internally by anomaly_rules.py.
 """
 
 import logging

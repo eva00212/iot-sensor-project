@@ -70,14 +70,9 @@ fi
 # ── 6. Systemd service ────────────────────────────────────────────────────────
 echo "==> Installing systemd service..."
 
-DEPLOY_HOME="$(eval echo ~"$DEPLOY_USER")"
-VENV_PYTHON="$DEPLOY_HOME/$(realpath --relative-to="$HOME" "$VENV_DIR")/bin/python3"
-WORK_DIR="$DEPLOY_HOME/$(realpath --relative-to="$HOME" "$PROJECT_ROOT/src")"
-SCRIPT="$DEPLOY_HOME/$(realpath --relative-to="$HOME" "$PROJECT_ROOT/src/collector.py")"
-
 sed \
     -e "s|User=.*|User=$DEPLOY_USER|" \
-    -e "s|WorkingDirectory=.*|WorkingDirectory=$WORK_DIR|" \
+    -e "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/src|" \
     -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/python3 $PROJECT_ROOT/src/collector.py|" \
     "$SERVICE_SRC" | sudo tee "$SERVICE_DST" > /dev/null
 

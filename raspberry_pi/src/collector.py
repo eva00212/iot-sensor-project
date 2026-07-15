@@ -56,26 +56,36 @@ import onem2m_converter
 import server_uploader
 
 def process(payload: dict) -> None:
-    """Entry point for the full processing pipeline."""
+    """Entry point for the full processing pipeline.
+
+    Wrapped in a broad try/except: an unexpected exception in any pipeline
+    stage (validation passed a shape a later stage didn't expect, a
+    transient anomaly-model error, etc.) must only drop this one reading,
+    never crash the whole collector -- the other two sensors on the bus
+    still need to keep being polled and uploaded.
+    """
     site_id   = payload.get("site_id")
     device_id = payload.get("device_id")
     logger.info("[%s / %s] polled: %s", site_id, device_id, payload)
 
-    validated = data_validator.safe_validate(payload)
-    if validated is None:
-        return
+    try:
+        validated = data_validator.safe_validate(payload)
+        if validated is None:
+            return
 
-    rule_result = anomaly_rules.check(validated)
-    if rule_result["rule_flags"]:
-        logger.warning("[%s / %s] Rule flags: %s", site_id, device_id, rule_result["rule_flags"])
+        rule_result = anomaly_rules.check(validated)
+        if rule_result["rule_flags"]:
+            logger.warning("[%s / %s] Rule flags: %s", site_id, device_id, rule_result["rule_flags"])
 
-    ai_result = anomaly_ai.score(validated)
-    if ai_result["ai_status"] == "anomaly":
-        logger.warning("[%s / %s] AI anomaly score: %s", site_id, device_id, ai_result["ai_score"])
+        ai_result = anomaly_ai.score(validated)
+        if ai_result["ai_status"] == "anomaly":
+            logger.warning("[%s / %s] AI anomaly score: %s", site_id, device_id, ai_result["ai_score"])
 
-    final = payload_builder.build(validated, rule_result, ai_result)
-    converted = onem2m_converter.convert(final)
-    server_uploader.upload(converted)
+        final = payload_builder.build(validated, rule_result, ai_result)
+        converted = onem2m_converter.convert(final)
+        server_uploader.upload(converted)
+    except Exception:
+        logger.exception("[%s / %s] Unexpected error in processing pipeline; dropping this reading.", site_id, device_id)
 
 # ── Missing Data Scheduler ────────────────────────────────────────────────────
 def _missing_data_loop():
