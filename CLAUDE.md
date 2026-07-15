@@ -55,7 +55,8 @@ iot-sensor-project/
 - oneM2M formatting will be finalized after server-side agreement
 
 ## Commands
-- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies
+- `raspberry_pi/install.sh` - full unattended deploy on a fresh Raspberry Pi OS install: system packages, venv, Python deps, UART enablement (reboots and resumes itself if needed), systemd service registration, and `site_config.yaml` scaffolding. The only manual step after this is editing `config/site_config.yaml`.
+- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies (already done by install.sh; useful standalone for local/dev work)
 - `python src/collector.py` - run the sensor collector (polls RS485, runs the pipeline)
 - `python src/simulator.py` - exercise the pipeline with synthetic readings, no hardware needed
 - `systemctl start sensor-collector` - start service

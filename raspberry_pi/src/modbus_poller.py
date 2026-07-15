@@ -125,11 +125,17 @@ def _read_block(slave_addr: int, start_reg: int, count: int) -> list | None:
     `slave_addr`, with retry/timeout handling. CRC validation and framing
     are handled internally by minimalmodbus. Returns the raw unsigned
     register values, or None if all attempts failed.
-    """
-    instrument = _get_instrument(slave_addr)
 
+    Instrument acquisition (which opens the serial port on first use) is
+    inside the retry loop, not just the read itself: right after boot the
+    UART device node can briefly not exist yet, or a USB-RS485 adapter can
+    be transiently unavailable, and that failure must be retried exactly
+    like any other transient Modbus error rather than raising out of the
+    poll loop.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            instrument = _get_instrument(slave_addr)
             return instrument.read_registers(start_reg, count, functioncode=FUNCTION_CODE)
         except (minimalmodbus.ModbusException, serial.SerialException, OSError) as e:
             logger.warning(

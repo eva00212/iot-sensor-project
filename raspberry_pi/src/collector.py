@@ -89,31 +89,57 @@ def process(payload: dict) -> None:
 
 # ── Missing Data Scheduler ────────────────────────────────────────────────────
 def _missing_data_loop():
-    """Background thread: checks for silent devices every 30 seconds."""
+    """Background thread: checks for silent devices every 30 seconds.
+
+    An unhandled exception in a daemon thread just kills that thread
+    silently and permanently -- catching here means one bad cycle can't
+    quietly disable the missing-data watchdog for the rest of the
+    service's uptime.
+    """
     while True:
         time.sleep(30)
-        missing = anomaly_rules.check_missing_data()
-        for (site_id, device_id), flags in missing.items():
-            logger.warning("[%s / %s] %s", site_id, device_id, flags)
+        try:
+            missing = anomaly_rules.check_missing_data()
+            for (site_id, device_id), flags in missing.items():
+                logger.warning("[%s / %s] %s", site_id, device_id, flags)
+        except Exception:
+            logger.exception("Unexpected error in missing-data scheduler; will retry next cycle.")
 
 # ── Buffer Flush Scheduler ────────────────────────────────────────────────────
 def _buffer_flush_loop():
-    """Background thread: retries buffered payloads every 5 minutes."""
+    """Background thread: retries buffered payloads every 5 minutes.
+    See _missing_data_loop for why this catches broadly."""
     while True:
         time.sleep(300)
-        server_uploader.flush_buffer()
+        try:
+            server_uploader.flush_buffer()
+        except Exception:
+            logger.exception("Unexpected error in buffer flush scheduler; will retry next cycle.")
 
 # ── Polling Loop ───────────────────────────────────────────────────────────────
+def _poll_one(poll_fn, site_id: str) -> None:
+    """Poll a single device and run it through the pipeline. modbus_poller
+    already retries transient I/O errors internally and reports a failed
+    poll as device_fault rather than raising -- this catch is a backstop
+    against anything unexpected slipping through, so one device's polling
+    code can never take the other two devices down with it."""
+    device_name = getattr(poll_fn, "__name__", str(poll_fn))
+    try:
+        process(poll_fn(site_id))
+    except Exception:
+        logger.exception("[%s / %s] Unexpected error polling device; skipping this cycle.", site_id, device_name)
+
+
 def _poll_cycle(site_id: str) -> None:
     """Sequentially polls device01, device02, device03 with a minimum gap
     between each, running every reading through the processing pipeline."""
-    process(modbus_poller.poll_device01(site_id))
+    _poll_one(modbus_poller.poll_device01, site_id)
     time.sleep(INTER_POLL_DELAY_SEC)
 
-    process(modbus_poller.poll_device02(site_id))
+    _poll_one(modbus_poller.poll_device02, site_id)
     time.sleep(INTER_POLL_DELAY_SEC)
 
-    process(modbus_poller.poll_device03(site_id))
+    _poll_one(modbus_poller.poll_device03, site_id)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:

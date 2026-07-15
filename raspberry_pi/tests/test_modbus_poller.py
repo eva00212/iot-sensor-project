@@ -213,6 +213,33 @@ class TestReadBlockRetry(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(fake_instrument.read_registers.call_count, modbus_poller.MAX_RETRIES)
 
+    def test_retries_when_instrument_acquisition_itself_fails(self):
+        # e.g. /dev/serial0 doesn't exist yet right after boot -- opening
+        # the port (inside _get_instrument) fails, not the read. This must
+        # be retried exactly like a failed read, not raise out of
+        # _read_block.
+        fake_instrument = MagicMock()
+        fake_instrument.read_registers.return_value = [1, 2, 3, 4]
+
+        with patch.object(
+            modbus_poller, "_get_instrument",
+            side_effect=[modbus_poller.serial.SerialException("port busy"), fake_instrument],
+        ) as mock_get:
+            result = modbus_poller._read_block(1, 504, 4)
+
+        self.assertEqual(result, [1, 2, 3, 4])
+        self.assertEqual(mock_get.call_count, 2)
+
+    def test_returns_none_when_instrument_acquisition_always_fails(self):
+        with patch.object(
+            modbus_poller, "_get_instrument",
+            side_effect=modbus_poller.serial.SerialException("no such device"),
+        ) as mock_get:
+            result = modbus_poller._read_block(1, 504, 4)
+
+        self.assertIsNone(result)
+        self.assertEqual(mock_get.call_count, modbus_poller.MAX_RETRIES)
+
 
 if __name__ == "__main__":
     unittest.main()
