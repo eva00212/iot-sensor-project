@@ -8,8 +8,17 @@ baudrate: 4800
 bytesize: 8
 parity: "N"          # N, E, or O
 stopbits: 1
-timeout_seconds: 0.5  # response wait timeout per attempt
-max_retries: 3        # attempts per poll before giving up
+timeout_seconds: 0.5  # response wait timeout per individual attempt
+
+# Retry behavior for a single register-block read. Independent of
+# poll_interval_seconds below -- this always retries the same number of
+# times with the same delay between attempts, whether polling every 10s
+# (dev/test) or every 600s (production). Exhausting all retries never
+# stops the collector: that one reading is reported with
+# device_fault = "true" (plus error_message) and normal operation resumes
+# automatically on the next scheduled poll.
+modbus_retry_count: 10          # attempts per register-block read before giving up
+modbus_retry_delay_seconds: 1.5 # delay between retry attempts
 
 inter_poll_delay_ms: 200    # min. gap between successive Modbus reads -- both
                              # between different slaves, and between the
@@ -17,4 +26,7 @@ inter_poll_delay_ms: 200    # min. gap between successive Modbus reads -- both
                              # poll. Matches the sensor manual's FAQ minimum
                              # ("host polling interval and response wait time
                              # must both be set to at least 200ms").
-poll_interval_ms: 30000     # how often to poll all 3 sensors
+
+# How often to poll all 3 sensors. 10s here for easy dev/testing
+# verification -- switch to 600 (10 minutes) for production.
+poll_interval_seconds: 10

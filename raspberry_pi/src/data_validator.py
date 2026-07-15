@@ -33,6 +33,13 @@ DEVICE_EXTRA_FIELDS = {
     },
 }
 
+# Optional fields validated only when present in the payload, regardless
+# of device_id -- e.g. error_message, set by modbus_poller when a Modbus
+# read exhausts all retries (alongside device_fault = "true").
+COMMON_OPTIONAL_FIELDS = {
+    "error_message": str,
+}
+
 # Optional fields: validated only when present in the payload
 DEVICE_OPTIONAL_FIELDS = {
     "device01": {"co2": (int, float)},
@@ -99,7 +106,7 @@ def validate(payload: dict) -> dict:
         raise ValidationError(f"Unknown device_id: '{device_id}'")
     _check_fields(payload, extra)
 
-    optional = DEVICE_OPTIONAL_FIELDS.get(device_id, {})
+    optional = {**COMMON_OPTIONAL_FIELDS, **DEVICE_OPTIONAL_FIELDS.get(device_id, {})}
     _check_optional_fields(payload, optional)
 
     return payload

@@ -29,11 +29,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ── Fields included in the server payload per device ─────────────────────────
+# error_message is only ever present when device_fault = "true" (set by
+# modbus_poller after exhausting all Modbus retries); the dict
+# comprehension in build() below omits it automatically otherwise.
 SERVER_FIELDS = {
-    "device01": ["temperature", "humidity", "co2", "device_fault"],
-    "device02": ["temperature", "humidity", "co2", "device_fault"],
+    "device01": ["temperature", "humidity", "co2", "device_fault", "error_message"],
+    "device02": ["temperature", "humidity", "co2", "device_fault", "error_message"],
     "device03": ["temperature", "humidity", "wind_speed", "rain_detected",
-                 "solar_radiation", "device_fault"],
+                 "solar_radiation", "device_fault", "error_message"],
 }
 
 # ── Public API ────────────────────────────────────────────────────────────────

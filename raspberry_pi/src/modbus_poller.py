@@ -51,7 +51,14 @@ BYTESIZE    = _cfg["bytesize"]
 PARITY      = _cfg["parity"]        # 'N', 'E', or 'O' — matches pyserial's PARITY_* constants
 STOPBITS    = _cfg["stopbits"]
 TIMEOUT_SEC = _cfg["timeout_seconds"]
-MAX_RETRIES = _cfg["max_retries"]
+
+# Retry behavior for a single register-block read. Independent of the poll
+# interval (collector.py's POLL_INTERVAL_SEC) by design -- this is the same
+# whether polling every 10s or every 600s. Exhausting all retries is
+# reported to the caller as (None, error_message), never raised: giving up
+# on one reading must never stop the collector.
+MAX_RETRIES      = _cfg["modbus_retry_count"]
+RETRY_DELAY_SEC  = _cfg["modbus_retry_delay_seconds"]
 
 # Minimum spacing between successive reads to the same device, per the
 # manual's FAQ requirement (>=200ms). Reuses the same config value
@@ -119,12 +126,14 @@ def _get_instrument(slave_addr: int) -> "minimalmodbus.Instrument":
     return inst
 
 
-def _read_block(slave_addr: int, start_reg: int, count: int) -> list | None:
+def _read_block(slave_addr: int, start_reg: int, count: int) -> tuple[list | None, str | None]:
     """
     Reads `count` holding registers starting at `start_reg` from
-    `slave_addr`, with retry/timeout handling. CRC validation and framing
-    are handled internally by minimalmodbus. Returns the raw unsigned
-    register values, or None if all attempts failed.
+    `slave_addr`, retrying up to MAX_RETRIES times with RETRY_DELAY_SEC
+    between attempts. CRC validation and framing are handled internally by
+    minimalmodbus. Returns (values, None) on success, or
+    (None, error_message) if every attempt failed -- this function never
+    raises for a communication failure, only for a programming error.
 
     Instrument acquisition (which opens the serial port on first use) is
     inside the retry loop, not just the read itself: right after boot the
@@ -133,18 +142,25 @@ def _read_block(slave_addr: int, start_reg: int, count: int) -> list | None:
     like any other transient Modbus error rather than raising out of the
     poll loop.
     """
+    last_error: Exception | None = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             instrument = _get_instrument(slave_addr)
-            return instrument.read_registers(start_reg, count, functioncode=FUNCTION_CODE)
+            values = instrument.read_registers(start_reg, count, functioncode=FUNCTION_CODE)
+            return values, None
         except (minimalmodbus.ModbusException, serial.SerialException, OSError) as e:
+            last_error = e
             logger.warning(
                 "[Modbus] slave 0x%02X reg %d attempt %d/%d: %s",
                 slave_addr, start_reg, attempt, MAX_RETRIES, e,
             )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SEC)
 
-    logger.error("[Modbus] slave 0x%02X reg %d: failed after %d attempts", slave_addr, start_reg, MAX_RETRIES)
-    return None
+    message = f"slave 0x{slave_addr:02X} reg {start_reg}: {type(last_error).__name__}: {last_error}"
+    logger.error("[Modbus] %s (failed after %d attempts)", message, MAX_RETRIES)
+    return None, message
 
 
 def _to_signed16(value: int) -> int:
@@ -166,9 +182,9 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
          worked example (section 4.4.3)
       2. register 507 (CO2) — single-register read
     """
-    ht_regs = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
+    ht_regs, ht_err = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
     time.sleep(INTER_READ_DELAY_SEC)
-    co2_regs = _read_block(slave_addr, REG_CO2, 1)
+    co2_regs, co2_err = _read_block(slave_addr, REG_CO2, 1)
 
     payload = {
         "site_id":   site_id,
@@ -186,7 +202,10 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     if co2_regs is not None:
         payload["co2"] = co2_regs[0]
 
-    payload["device_fault"] = "false" if (ht_regs is not None and co2_regs is not None) else "true"
+    errors = [e for e in (ht_err, co2_err) if e]
+    payload["device_fault"] = "true" if errors else "false"
+    if errors:
+        payload["error_message"] = "; ".join(errors)
     return payload
 
 
@@ -203,13 +222,13 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
       3. register 513 (rainfall)
       4. register 515 (solar radiation)
     """
-    wind_regs = _read_block(slave_addr, REG_WIND_SPEED, 1)
+    wind_regs, wind_err   = _read_block(slave_addr, REG_WIND_SPEED, 1)
     time.sleep(INTER_READ_DELAY_SEC)
-    ht_regs = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
+    ht_regs, ht_err       = _read_block(slave_addr, HUMID_TEMP_REG_START, HUMID_TEMP_REG_COUNT)
     time.sleep(INTER_READ_DELAY_SEC)
-    rain_regs = _read_block(slave_addr, REG_RAINFALL, 1)
+    rain_regs, rain_err   = _read_block(slave_addr, REG_RAINFALL, 1)
     time.sleep(INTER_READ_DELAY_SEC)
-    solar_regs = _read_block(slave_addr, REG_SOLAR, 1)
+    solar_regs, solar_err = _read_block(slave_addr, REG_SOLAR, 1)
 
     payload = {
         "site_id":   site_id,
@@ -240,8 +259,10 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     if solar_regs is not None:
         payload["solar_radiation"] = round(solar_regs[0] * SOLAR_SCALE, 1)
 
-    all_ok = all(r is not None for r in (wind_regs, ht_regs, rain_regs, solar_regs))
-    payload["device_fault"] = "false" if all_ok else "true"
+    errors = [e for e in (wind_err, ht_err, rain_err, solar_err) if e]
+    payload["device_fault"] = "true" if errors else "false"
+    if errors:
+        payload["error_message"] = "; ".join(errors)
     return payload
 
 

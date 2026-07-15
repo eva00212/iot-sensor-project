@@ -26,18 +26,28 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "rule_config.yaml"
+CONFIG_PATH        = Path(__file__).parent.parent / "config" / "rule_config.yaml"
+MODBUS_CONFIG_PATH = Path(__file__).parent.parent / "config" / "modbus_config.yaml"
 
-def _load_config() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+def _load_yaml(path: Path) -> dict:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-_cfg = _load_config()
+_cfg        = _load_yaml(CONFIG_PATH)
+_modbus_cfg = _load_yaml(MODBUS_CONFIG_PATH)
 
-RANGES         = _cfg["ranges"]
-SUDDEN_CHANGE  = _cfg["sudden_change"]
-CROSS_CHECK    = _cfg["indoor_cross_check"]
-MISSING_TIMEOUT = _cfg["missing_data"]["timeout_seconds"]
+RANGES        = _cfg["ranges"]
+SUDDEN_CHANGE = _cfg["sudden_change"]
+CROSS_CHECK   = _cfg["indoor_cross_check"]
+
+# Missing-data timeout is expressed as a multiple of the poll interval
+# (modbus_config.yaml's poll_interval_seconds) rather than a fixed number
+# of seconds, so it scales automatically whether the collector is polling
+# every 10s (dev/test) or every 600s (production) -- a fixed absolute
+# timeout tuned for one would either never trigger or constantly false-
+# positive under the other.
+MISSING_TIMEOUT_MULTIPLIER = _cfg["missing_data"]["timeout_multiplier"]
+MISSING_TIMEOUT = _modbus_cfg["poll_interval_seconds"] * MISSING_TIMEOUT_MULTIPLIER
 
 # ── Fields checked per device ─────────────────────────────────────────────────
 RANGE_FIELDS = {

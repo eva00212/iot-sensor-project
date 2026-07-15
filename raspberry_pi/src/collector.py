@@ -42,7 +42,7 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(f)
 
 _modbus_cfg = load_config(MODBUS_CONFIG_PATH)
-POLL_INTERVAL_SEC    = _modbus_cfg["poll_interval_ms"] / 1000
+POLL_INTERVAL_SEC    = _modbus_cfg["poll_interval_seconds"]
 INTER_POLL_DELAY_SEC = _modbus_cfg["inter_poll_delay_ms"] / 1000
 
 SITE_ID = load_config(SITE_CONFIG_PATH)["site_id"]

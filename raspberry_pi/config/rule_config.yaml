@@ -18,4 +18,8 @@ indoor_cross_check:
   co2:         200.0
 
 missing_data:
-  timeout_seconds: 60   # flag if no message received within this period
+  # Flag a device if no message is received within this many poll
+  # intervals' worth of time (poll_interval_seconds, in modbus_config.yaml)
+  # -- e.g. 3 missed cycles in a row, whether that's 30s at a 10s dev/test
+  # interval or 30 minutes at a 600s production interval.
+  timeout_multiplier: 3

@@ -72,6 +72,8 @@ iot-sensor-project/
 - AI models are used only as supplementary analysis
 - oneM2M conversion is applied before server transmission
 - `device_fault` reflects a failed Modbus poll (timeout, CRC error, or exhausted retries) for that sensor, not a voltage reading
+- When `device_fault` is `"true"`, the payload also carries `error_message` (a short description of the last Modbus error, per failed sub-read); it's omitted entirely when there's no fault
+- Modbus retry count/delay are independent of the poll interval by design — the same `modbus_retry_count`/`modbus_retry_delay_seconds` apply whether polling every 10s (dev/test) or every 600s (production), and exhausting all retries never stops the collector
 - Illumination is not used because there is no dedicated illumination sensor
 - Solar radiation is used as the outdoor light-related measurement field
 - Sensor polling (RS485) and the LTE uplink are independent failure domains: an LTE outage never blocks or slows sensor polling — readings queue to disk and drain once the link returns
@@ -118,6 +120,21 @@ Raspberry Pi
 - Each deployed Pi's MQTT `client_id` is auto-suffixed with its `site_id` so
   multiple test-bed Pis sharing the same `site_config.example.yaml` template
   never collide on the broker (only one connection per client_id is allowed).
+
+## Configuration (`raspberry_pi/config/modbus_config.yaml`)
+| Key | Meaning | Dev/test default | Production |
+|-----|---------|-------------------|------------|
+| `poll_interval_seconds` | How often all 3 sensors are polled | `10` | `600` (10 min) |
+| `modbus_retry_count` | Attempts per register-block read before giving up | `10` | `10` |
+| `modbus_retry_delay_seconds` | Delay between retry attempts | `1.5` | `1.5` |
+
+Retry count/delay are independent of the poll interval — swapping
+`poll_interval_seconds` between dev and production doesn't require any
+code change or retune of the retry settings. `rule_config.yaml`'s
+`missing_data.timeout_multiplier` (default `3`) is likewise expressed as a
+multiple of `poll_interval_seconds` rather than a fixed number of seconds,
+so the "device gone silent" watchdog scales automatically with whichever
+poll interval is active instead of needing to be hand-tuned per environment.
 
 ## Sensor Fields
 
@@ -227,13 +244,34 @@ device type and only extracts the fields relevant to it.
 }
 ```
 
+## Example Fault Payload (Indoor Node)
+Sent when a register read exhausts all `modbus_retry_count` attempts;
+`error_message` is omitted entirely when there's no fault.
+```json
+{
+  "site_id": "testBed01",
+  "device_id": "device01",
+  "timestamp": "2026-03-10T12:10:21",
+  "temperature": 0.0,
+  "humidity": 0.0,
+  "device_fault": "true",
+  "error_message": "slave 0x01 reg 504: NoResponseError: no response from the slave"
+}
+```
+The collector keeps polling on its normal schedule after a fault — no
+special backoff or restart is needed. The very next successful poll of
+that device reports `device_fault: "false"` again automatically.
+
 ## Data Processing Order
 
 ### Step 1. Sensor Polling
 The Raspberry Pi sequentially polls device01, device02, and device03 over
 the shared RS485 bus using Modbus RTU (function code `0x03`), with CRC
-validation, timeouts, and retries. A failed poll produces a payload with
-`device_fault: "true"`.
+validation, timeouts, and retries (`modbus_retry_count` attempts,
+`modbus_retry_delay_seconds` apart — see Configuration). A failed poll
+produces a payload with `device_fault: "true"` and `error_message` set,
+never an exception — the collector process is never terminated by a
+Modbus communication failure.
 
 ### Step 2. Data Validation
 - Validate required fields
