@@ -32,15 +32,20 @@ iot-sensor-project/
 │   │   ├── modbus_config.yaml         # RS485 serial port + polling settings
 │   │   └── rule_config.yaml           # anomaly rule configuration
 │   │
-│   ├── tests/                    # unit tests (modbus_poller parsing/CRC/retry logic, anomaly_rules, server_uploader buffering)
+│   ├── tests/                    # unit tests (modbus_poller parsing/CRC/retry logic, anomaly_rules,
+│   │                              # server_uploader buffering, update_site_id); test_prepare_master_image.sh
+│   │                              # is a separate bash test, not picked up by unittest discover
 │   ├── logs/                     # runtime logs
 │   ├── service/                  # systemd service files
 │   ├── install.sh                # single entry point: full unattended Pi deployment
-│   └── verify_install.sh         # read-only PASS/FAIL deployment verification report
+│   ├── verify_install.sh         # read-only PASS/FAIL deployment verification report
+│   ├── prepare_master_image.sh   # run on the master before imaging its SD card for cloning
+│   └── finalize_clone.sh         # run once on each cloned Pi after first boot
 │
 └── docs/
     └── DEPLOYMENT.md              # why install.sh works the way it does, what's still
-                                    # manual and why, long-term field reliability notes
+                                    # manual and why, long-term field reliability notes,
+                                    # fleet deployment via SD card cloning
 ```
 
 ## Code Style Rules
@@ -61,6 +66,8 @@ iot-sensor-project/
 ## Commands
 - `raspberry_pi/install.sh` - full unattended deploy on a fresh Raspberry Pi OS install: system packages, venv, Python deps, UART enablement (reboots and resumes itself if needed), persistent journal, systemd service registration, and `site_config.yaml` scaffolding. The only manual step after this is editing `config/site_config.yaml`. See `docs/DEPLOYMENT.md`.
 - `raspberry_pi/verify_install.sh` - read-only PASS/FAIL/WARN report of every deployment prerequisite (UART config, permissions, systemd service, MQTT connectivity, etc.) — run after install.sh, after a reboot, or to diagnose a misbehaving device
+- `raspberry_pi/prepare_master_image.sh` - run on a verified Pi immediately before imaging its SD card for fleet cloning: stops the service, clears logs/buffer/AI models, preserves site_config.yaml and everything else. Safe to re-run.
+- `raspberry_pi/finalize_clone.sh <site_id>` - run once on each cloned Pi after first boot: assigns a unique site_id/hostname, regenerates machine-id/SSH host keys, restarts the service, runs verify_install.sh. See `docs/DEPLOYMENT.md`.
 - `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies (already done by install.sh; useful standalone for local/dev work)
 - `python src/collector.py` - run the sensor collector (polls RS485, runs the pipeline)
 - `python src/simulator.py` - exercise the pipeline with synthetic readings, no hardware needed

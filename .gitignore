@@ -14,6 +14,10 @@ raspberry_pi/logs/
 # Config secrets (copy from site_config.example.yaml)
 raspberry_pi/config/site_config.yaml
 
+# Per-device finalize_clone.sh marker (records this device's assigned
+# site_id/hostname/timestamp -- local runtime state, not project state)
+raspberry_pi/config/.finalized
+
 # Local AI tool config (machine-specific, not project state)
 .claude/
 

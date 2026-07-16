@@ -140,6 +140,118 @@ live MQTT broker connectivity check using your actual `site_config.yaml`
 settings. Each line is `[PASS]`, `[FAIL]`, or `[WARN]`; the script exits
 non-zero if anything failed.
 
+## Fleet deployment via SD card cloning
+
+For deploying several Pis at once (e.g. 8 test beds), preparing one Pi
+fully via `install.sh` and then cloning its SD card to the others is
+faster than running `install.sh` on all 8 individually — but a raw disk
+clone also duplicates state that must be *unique* per device: an
+undelivered MQTT buffer tagged with the wrong `site_id`, SSH host keys,
+and `/etc/machine-id` all get copied byte-for-byte along with everything
+else. `prepare_master_image.sh` and `finalize_clone.sh` handle the two
+ends of that safely.
+
+**What's safe to clone as-is, and why:** `client_id` and every MQTT topic
+are derived entirely from `site_config.yaml`'s `site_id` at runtime
+(`server_uploader.py`: `f"{client_id}-{site_id}"`;
+`onem2m_converter.py`: `f"/multisensing/{site_id}/{device_id}"`) — nothing
+is hardcoded, so as long as each clone ends up with a unique `site_id`,
+there's no MQTT collision risk. UART/`config.txt`/`cmdline.txt` settings
+are also safe and *desirable* to clone unchanged, since they're
+hardware-level config that's identical across every Pi 5 in the fleet,
+not per-site.
+
+**What must not be cloned as-is:** `logs/buffer.jsonl` is a fixed path,
+not `site_id`-qualified — if the master ever had an undelivered MQTT
+message queued before imaging, that file contains a fully-built payload
+with the master's `site_id` already baked into the JSON body. Cloned to
+another device, the first successful reconnect would publish the
+master's stale data under the clone's identity. `models/*.pkl` are
+`site_id`-qualified by filename (`anomaly_ai.py`), so a stale clone is
+harmless but wasteful — dead files that never match the new `site_id`.
+SSH host keys and `/etc/machine-id` aren't tracked in this repo but are
+real files that get cloned with the disk image regardless; identical
+values across 8 devices is a real (if minor) security weakness for SSH
+host keys specifically, since any of them could then be impersonated
+against the others.
+
+### 1. Prepare the master (once, before imaging)
+
+```bash
+cd ~/iot-sensor-project/raspberry_pi
+./prepare_master_image.sh
+```
+
+Stops `sensor-collector`, removes `logs/buffer.jsonl`,
+`logs/collector.log*`, and `models/*.pkl`, and prints exactly what it
+removed. Leaves `config/site_config.yaml`, project code, `.venv/`, UART
+config, and the systemd service untouched — the master keeps its own
+valid config, since (per your plan) it's one of the deployed units, not
+a throwaway golden image. Safe to run more than once.
+
+Then power off (`sudo systemctl poweroff`) and image the SD card with
+your cloning tool of choice.
+
+### 2. Clone the image to the other cards
+
+Outside this repo's scope (tooling-dependent — Raspberry Pi Imager
+writing a captured `.img`, `dd`, `rpi-clone`, etc.). One general note: if
+you clone via raw `dd` without a tool that randomizes partition UUIDs,
+every card gets an identical `PARTUUID`. For this deployment pattern
+(each Pi always running its own single SD card, never multiple cards
+visible to the same system at once) that causes no practical conflict —
+worth knowing, not worth worrying about here.
+
+### 3. Finalize each clone (once per clone, after first boot)
+
+```bash
+cd ~/iot-sensor-project/raspberry_pi
+./finalize_clone.sh testBed03      # use that device's actual site_id
+```
+
+Do **not** run this on the master — it already has its own valid
+identity from step 1. Run it once on each of the *other* clones. It:
+
+1. Validates `site_id` (must be `testBed01`..`testBed08`)
+2. If this device was already finalized before, requires you to
+   **type the site_id again to confirm** before proceeding — this is
+   the safeguard against accidentally re-finalizing (or reusing) a
+   clone under the wrong identity
+3. Updates only the `site_id:` line in `config/site_config.yaml` (via
+   `tools/update_site_id.py`), leaving every other setting — server
+   host, MQTT tuning, everything cloned correctly from the master —
+   byte-for-byte untouched
+4. Sets the hostname to match (lowercased, e.g. `testbed03`)
+5. Regenerates `/etc/machine-id`
+6. Regenerates SSH host keys
+7. Refreshes `/var/lib/systemd/random-seed`
+8. Prints the resulting MQTT `client_id` and an example topic, so you
+   can see the new identity took effect before trusting it
+9. Enables and restarts `sensor-collector`
+10. Runs `./verify_install.sh`
+
+Every step's result is tracked and reported in a final PASS/FAIL summary
+regardless of whether an earlier step failed, so one failure doesn't
+hide whether the rest of the process succeeded — read the whole summary
+before deciding the device is ready.
+
+### Testing
+
+`tools/update_site_id.py`'s surgical edit (the part of this workflow with
+real correctness risk — accidentally clobbering the rest of
+`site_config.yaml`) has a full test suite in `tests/test_update_site_id.py`
+(part of the normal `python -m unittest discover raspberry_pi/tests` run).
+`prepare_master_image.sh`'s file-handling logic has its own bash-level
+test, `tests/test_prepare_master_image.sh` — run separately with
+`bash raspberry_pi/tests/test_prepare_master_image.sh`, since it isn't
+Python and won't be picked up by `unittest discover`.
+`finalize_clone.sh` doesn't have an equivalent end-to-end test: unlike
+`prepare_master_image.sh`, its operations (hostname, `/etc/machine-id`,
+SSH host keys) are genuinely system-level and can't be exercised safely
+without modifying a real system. Its one piece of real logic risk — the
+`site_config.yaml` edit — is covered indirectly, since it calls the same
+tested `update_site_id.py` rather than reimplementing that logic itself.
+
 ## Long-term field deployment: additional findings
 
 Beyond the UART/reproducibility work above, reviewing the project for
@@ -179,7 +291,10 @@ about, not all of which were in scope to fix here:
   becomes a problem in practice.
 - **Multi-device rollout.** Because every step in `install.sh` is
   idempotent and every per-site value lives only in
-  `config/site_config.yaml`, the same `git clone && ./install.sh` process
-  is the correct procedure for the first Pi, the tenth Pi, or re-imaging
-  an existing one after an SD card failure — there's no separate
-  "fleet setup" process to maintain.
+  `config/site_config.yaml`, `git clone && ./install.sh` is the correct
+  procedure for the first Pi, the tenth Pi, or re-imaging an existing one
+  after an SD card failure — there's no separate "fleet setup" process to
+  maintain. For deploying several Pis at once specifically, see "Fleet
+  deployment via SD card cloning" above — `prepare_master_image.sh` /
+  `finalize_clone.sh` handle the state that a raw disk clone duplicates
+  but shouldn't (undelivered MQTT buffer, SSH host keys, machine-id).
