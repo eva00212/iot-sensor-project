@@ -34,9 +34,13 @@ iot-sensor-project/
 │   │
 │   ├── tests/                    # unit tests (modbus_poller parsing/CRC/retry logic, anomaly_rules, server_uploader buffering)
 │   ├── logs/                     # runtime logs
-│   └── service/                  # systemd service files
+│   ├── service/                  # systemd service files
+│   ├── install.sh                # single entry point: full unattended Pi deployment
+│   └── verify_install.sh         # read-only PASS/FAIL deployment verification report
 │
-└── docs/                         # system documentation
+└── docs/
+    └── DEPLOYMENT.md              # why install.sh works the way it does, what's still
+                                    # manual and why, long-term field reliability notes
 ```
 
 ## Code Style Rules
@@ -55,7 +59,8 @@ iot-sensor-project/
 - oneM2M formatting will be finalized after server-side agreement
 
 ## Commands
-- `raspberry_pi/install.sh` - full unattended deploy on a fresh Raspberry Pi OS install: system packages, venv, Python deps, UART enablement (reboots and resumes itself if needed), systemd service registration, and `site_config.yaml` scaffolding. The only manual step after this is editing `config/site_config.yaml`.
+- `raspberry_pi/install.sh` - full unattended deploy on a fresh Raspberry Pi OS install: system packages, venv, Python deps, UART enablement (reboots and resumes itself if needed), persistent journal, systemd service registration, and `site_config.yaml` scaffolding. The only manual step after this is editing `config/site_config.yaml`. See `docs/DEPLOYMENT.md`.
+- `raspberry_pi/verify_install.sh` - read-only PASS/FAIL/WARN report of every deployment prerequisite (UART config, permissions, systemd service, MQTT connectivity, etc.) — run after install.sh, after a reboot, or to diagnose a misbehaving device
 - `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies (already done by install.sh; useful standalone for local/dev work)
 - `python src/collector.py` - run the sensor collector (polls RS485, runs the pipeline)
 - `python src/simulator.py` - exercise the pipeline with synthetic readings, no hardware needed
