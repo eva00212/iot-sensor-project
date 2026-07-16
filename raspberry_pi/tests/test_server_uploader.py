@@ -79,6 +79,31 @@ class TestUpload(BufferTestCase):
         self.assertEqual(len(self._buffer_lines()), 1)
 
 
+class TestBufferIsBounded(BufferTestCase):
+    """A sustained outage must not let buffer.jsonl grow without limit --
+    MAX_BUFFERED_MESSAGES caps it, dropping the oldest queued payload(s)
+    to make room for the newest."""
+
+    def test_oldest_entries_dropped_once_cap_exceeded(self):
+        with patch.object(server_uploader, "MAX_BUFFERED_MESSAGES", 3), \
+             patch.object(server_uploader._client, "is_connected", return_value=False):
+            for i in range(5):
+                server_uploader.upload({"topic": "t", "body": str(i)})
+
+        remaining = [json.loads(l)["body"] for l in self._buffer_lines()]
+        # Oldest (0, 1) dropped; newest 3 (bounded) kept, in order.
+        self.assertEqual(remaining, ["2", "3", "4"])
+
+    def test_stays_under_cap_when_never_exceeded(self):
+        with patch.object(server_uploader, "MAX_BUFFERED_MESSAGES", 100), \
+             patch.object(server_uploader._client, "is_connected", return_value=False):
+            for i in range(3):
+                server_uploader.upload({"topic": "t", "body": str(i)})
+
+        remaining = [json.loads(l)["body"] for l in self._buffer_lines()]
+        self.assertEqual(remaining, ["0", "1", "2"])
+
+
 class TestFlushBuffer(BufferTestCase):
     def _write_lines(self, *payloads):
         text = "\n".join(json.dumps(p) for p in payloads) + "\n"

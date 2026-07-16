@@ -24,3 +24,6 @@ server:
   flush:
     batch_size: 20               # max buffered messages retransmitted per pass
     pacing_seconds: 1            # delay between each retransmission
+    max_buffered_messages: 10000 # bounds buffer.jsonl during a long outage --
+                                  # oldest queued payloads are dropped once
+                                  # this many are queued

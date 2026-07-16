@@ -5,7 +5,7 @@ A test-bed-based environmental monitoring system. Two indoor sensors and one out
 
 ## Tech Stack
 - Language: Python
-- Framework: paho-mqtt, minimalmodbus
+- Framework: paho-mqtt, pyserial (hand-rolled Modbus RTU in modbus_poller.py — see Modbus Register Map; minimalmodbus is only used by the standalone tools/test_modbus_sensor.py diagnostic script, not the collector)
 - Database: TBD (server side)
 - Edge Device: Raspberry Pi 5 (with an attached RS485 interface and an LTE modem/router for uplink)
 - Communication: RS485 Modbus RTU (sensors ↔ Pi), MQTT/oneM2M over LTE (Pi ↔ server)
@@ -32,7 +32,7 @@ iot-sensor-project/
 │   │   ├── modbus_config.yaml         # RS485 serial port + polling settings
 │   │   └── rule_config.yaml           # anomaly rule configuration
 │   │
-│   ├── tests/                    # unit tests (modbus_poller parsing/CRC logic)
+│   ├── tests/                    # unit tests (modbus_poller parsing/CRC/retry logic, anomaly_rules, server_uploader buffering)
 │   ├── logs/                     # runtime logs
 │   └── service/                  # systemd service files
 │
@@ -55,7 +55,8 @@ iot-sensor-project/
 - oneM2M formatting will be finalized after server-side agreement
 
 ## Commands
-- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies
+- `raspberry_pi/install.sh` - full unattended deploy on a fresh Raspberry Pi OS install: system packages, venv, Python deps, UART enablement (reboots and resumes itself if needed), systemd service registration, and `site_config.yaml` scaffolding. The only manual step after this is editing `config/site_config.yaml`.
+- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies (already done by install.sh; useful standalone for local/dev work)
 - `python src/collector.py` - run the sensor collector (polls RS485, runs the pipeline)
 - `python src/simulator.py` - exercise the pipeline with synthetic readings, no hardware needed
 - `systemctl start sensor-collector` - start service
@@ -71,7 +72,10 @@ iot-sensor-project/
 - AI models are used only as supplementary analysis
 - oneM2M conversion is applied before server transmission
 - `device_fault` reflects a failed Modbus poll (timeout, CRC error, or exhausted retries) for that sensor, not a voltage reading
-- Illumination is not used because there is no dedicated illumination sensor
+- When `device_fault` is `"true"`, the payload also carries `error_message` (a description of the last Modbus error) and `retry_count` (how many attempts were made — up to `modbus_retry_count`); both are omitted entirely when there's no fault
+- On a failed poll, measurement fields (`temperature`, `humidity`, `co2`, `wind_speed`, etc.) are never fabricated as `0.0`/`false` — they're omitted from the payload entirely, since a zeroed reading would be indistinguishable from a real measurement of zero to anything downstream
+- Modbus retry count/delay are independent of the poll interval by design — the same `modbus_retry_count`/`modbus_retry_delay_seconds` apply whether polling every 10s (dev/test) or every 600s (production), and exhausting all retries never stops the collector
+- Illumination is not used because there is no dedicated illumination sensor. The lux registers (510-512) are physically present in the shared register table (the block read already covers them) but are not extracted into the payload — this was re-confirmed deliberately when device03's field set was expanded to add wind_direction/rainfall/pressure, not overlooked. If a future variant does have a reliable illumination sensor, wiring it up is a small addition to `poll_outdoor()` (combine registers 510+511 per `rs485_weather_station.py`'s `read_all()`), not a redesign.
 - Solar radiation is used as the outdoor light-related measurement field
 - Sensor polling (RS485) and the LTE uplink are independent failure domains: an LTE outage never blocks or slows sensor polling — readings queue to disk and drain once the link returns
 
@@ -111,12 +115,46 @@ Raspberry Pi
   periodic schedule. Buffered messages are removed one at a time, immediately
   after each confirmed send, to avoid duplicate retransmission if the process
   restarts mid-flush.
+- `logs/buffer.jsonl` is bounded by `server.flush.max_buffered_messages`
+  (default 10000) — a sustained multi-day outage drops the oldest queued
+  payload(s) to make room for the newest rather than growing the file
+  without limit.
+- `logs/collector.log` rotates automatically (10 MB per file, 5 backups
+  kept, ~60 MB ceiling total) — see `collector.py`'s `RotatingFileHandler`
+  setup — so it can't grow indefinitely over months/years of unattended
+  operation.
 - The server is always addressed by hostname (`site_config.yaml`'s
   `server.host`), never a hardcoded IP or network interface — LTE links are
   typically NAT'd and the Pi's own address can change between sessions.
 - Each deployed Pi's MQTT `client_id` is auto-suffixed with its `site_id` so
   multiple test-bed Pis sharing the same `site_config.example.yaml` template
   never collide on the broker (only one connection per client_id is allowed).
+
+## Configuration (`raspberry_pi/config/modbus_config.yaml`)
+| Key | Meaning | Shipped (production) value |
+|-----|---------|------------------------------|
+| `poll_interval_seconds` | How often all 3 sensors are polled | `600` (10 min) |
+| `modbus_retry_count` | Attempts per register-block read before giving up | `10` |
+| `modbus_retry_delay_seconds` | Delay between retry attempts | `1.5` |
+
+For fast local dev/testing, override `poll_interval_seconds` (e.g. to
+`10`) in your own working copy — don't commit a dev value here.
+
+Retry count/delay are independent of the poll interval — changing
+`poll_interval_seconds` doesn't require any code change or retune of the
+retry settings. `rule_config.yaml`'s `missing_data.timeout_multiplier`
+(default `2`) is likewise expressed as a multiple of
+`poll_interval_seconds` rather than a fixed number of seconds, so the
+"device gone silent" watchdog scales automatically with whichever poll
+interval is active instead of needing to be hand-tuned per environment —
+at the shipped `600`, that's a 1200s (20 min) effective timeout. See
+Anomaly Detection Strategy below for `rule_config.yaml`'s other
+thresholds (`ranges`, `rapid_change`, `stuck_sensor`,
+`indoor_cross_check`).
+
+`site_config.yaml`'s `server.flush.max_buffered_messages` (default
+`10000`) bounds how large `logs/buffer.jsonl` can grow during a sustained
+LTE outage — see Deployment Notes.
 
 ## Sensor Fields
 
@@ -129,61 +167,83 @@ Raspberry Pi
 
 ### Outdoor Sensors
 - wind_speed
+- wind_direction
+- rainfall
 - rain_detected
 - solar_radiation
+- pressure
+- (illuminance is deliberately not published — see Important Notes)
 
-### Device Status
-- device_fault
+### Device Status / Failure Metadata
+- device_fault (always present)
+- error_message (present only when `device_fault = "true"`)
+- retry_count (present only when `device_fault = "true"`)
+
+All measurement fields above are present only on a successful reading —
+see Important Notes on why failed readings never fabricate `0.0`/`false`
+fallback values.
 
 ## Node Configuration
 
 ### device01 (indoor)
-- temperature
-- humidity
-- co2
-- device_fault
+- temperature, humidity, co2 (on success)
+- device_fault (always); error_message, retry_count (on fault)
 
 ### device02 (indoor)
-- temperature
-- humidity
-- co2
-- device_fault
+- temperature, humidity, co2 (on success)
+- device_fault (always); error_message, retry_count (on fault)
 
 ### device03 (outdoor)
-- temperature
-- humidity
-- wind_speed
-- rain_detected
-- solar_radiation
-- device_fault
+- temperature, humidity, wind_speed, wind_direction, rainfall,
+  rain_detected, solar_radiation, pressure (on success)
+- device_fault (always); error_message, retry_count (on fault)
+- device03 never publishes `co2` — it has no CO2 sensor
 
 ## Modbus Register Map
 All three sensors are wired directly to the Raspberry Pi's RS485 interface
 over one shared bus (4800 baud, 8N1), each with its own Modbus slave
-address. `modbus_poller.py` polls every sensor with Modbus function code
-`0x03` (Read Holding Registers); CRC validation and RTU framing are handled
-by the `minimalmodbus` library, with application-level retry/timeout
-handling on top.
+address. `modbus_poller.py` polls **every** sensor — indoor or outdoor —
+with a single Modbus function-code-`0x03` (Read Holding Registers)
+transaction reading the full register block **500–515 (16 registers)**,
+then extracts only the fields relevant to that device's variant locally.
 
-| Slave addr | Device     | Registers read |
-|------------|------------|-----------------|
-| `0x01`     | `device01` | 504–507 |
-| `0x02`     | `device02` | 504–507 |
-| `0x03`     | `device03` | 500–515 |
+This is a hand-rolled Modbus RTU implementation (raw `pyserial` + manual
+CRC16/frame building — not the `minimalmodbus` library), ported directly
+from `rs485_weather_station.py`, which was independently verified against
+this exact hardware. An earlier version of `modbus_poller.py` used
+`minimalmodbus` with several *narrow* reads per device instead of one
+full-block read — every request timed out on real hardware with that
+approach. **Do not split this back into narrow per-field reads, and do not
+reintroduce minimalmodbus, without re-verifying against real hardware
+first.**
+
+| Slave addr | Device     | Registers read (every poll) |
+|------------|------------|-------------------------------|
+| `0x01`     | `device01` | 500–515 (full block; only 504/505/507 are used) |
+| `0x02`     | `device02` | 500–515 (full block; only 504/505/507 are used) |
+| `0x03`     | `device03` | 500–515 (full block; 500/503/504/505/509/513/515 are used) |
 
 | Register | Field | Scaling | Notes |
 |----------|-------|---------|-------|
 | 500 | wind_speed | raw × 0.1 m/s | device03 only |
+| 503 | wind_direction | raw = degrees (0-360, compass bearing) | device03 only |
 | 504 | humidity | raw × 0.1 %RH | |
 | 505 | temperature | raw × 0.1 °C | signed 16-bit (two's complement) |
 | 507 | co2 | raw integer, ppm | device01/device02 only (CO2 variant) |
-| 513 | rainfall amount | raw × 0.1 mm | internal only — not sent in the payload. Used to derive `rain_detected = rainfall > 0` |
+| 509 | pressure | raw × 0.1 kPa | device03 only |
+| 513 | rainfall | raw × 0.1 mm | device03 only. Published directly, and also used to derive `rain_detected = rainfall > 0` |
 | 515 | solar_radiation | raw value, W/m² | device03 only |
+
+Registers 501/502 (wind force/octant), 506 (noise), 508 (PM10), 510-512
+(lux, combinable into an illuminance value), and 514 (compass heading) are
+present in the sensor's shared table but are not extracted — see Important
+Notes on illuminance specifically.
 
 `device01`/`device02` and `device03` are the same sensor family sharing one
 register table — each variant only populates the registers for the sensors
-it has installed, so the board block-reads the full register span for its
-device type and only extracts the fields relevant to it.
+it has installed. Because it's a single transaction per poll, a Modbus
+failure now affects the whole reading (all fields fall back together),
+not individual fields.
 
 ## MQTT Topic Structure
 ```text
@@ -220,19 +280,48 @@ device type and only extracts the fields relevant to it.
   "temperature": 23.8,
   "humidity": 61.4,
   "wind_speed": 1.4,
+  "wind_direction": 270.0,
+  "rainfall": 0.0,
   "rain_detected": "false",
   "solar_radiation": 520.0,
+  "pressure": 101.3,
   "device_fault": "false"
 }
 ```
+
+## Example Fault Payload (Indoor Node)
+Sent when a register read exhausts all `modbus_retry_count` attempts.
+`error_message`/`retry_count` are omitted entirely when there's no fault
+— and on a fault, so are all the measurement fields (`temperature`,
+`humidity`, `co2`, ...). They are **never** reported as `0.0`/`false`
+fallback values, since that would be indistinguishable from a real
+measurement to anything downstream.
+```json
+{
+  "site_id": "testBed01",
+  "device_id": "device01",
+  "timestamp": "2026-03-10T12:10:21",
+  "device_fault": "true",
+  "error_message": "slave 0x01: ModbusError: No/short response from slave 0x01 (0 bytes) -- check wiring/address/baud rate",
+  "retry_count": 10
+}
+```
+The collector keeps polling on its normal schedule after a fault — no
+special backoff or restart is needed. The very next successful poll of
+that device reports `device_fault: "false"` again automatically, with
+`error_message`/`retry_count` gone and measurement fields back.
 
 ## Data Processing Order
 
 ### Step 1. Sensor Polling
 The Raspberry Pi sequentially polls device01, device02, and device03 over
 the shared RS485 bus using Modbus RTU (function code `0x03`), with CRC
-validation, timeouts, and retries. A failed poll produces a payload with
-`device_fault: "true"`.
+validation, timeouts, and retries (`modbus_retry_count` attempts,
+`modbus_retry_delay_seconds` apart — see Configuration). A failed poll
+produces a payload with `device_fault: "true"`, `error_message`, and
+`retry_count` set (measurement fields omitted, never fabricated), never
+an exception — the collector process is never terminated by a Modbus
+communication failure.
 
 ### Step 2. Data Validation
 - Validate required fields
@@ -241,11 +330,12 @@ validation, timeouts, and retries. A failed poll produces a payload with
 - Filter malformed or corrupted data
 
 ### Step 3. Rule-based Anomaly Detection
-- Missing data detection
-- Range validation
-- Sudden change detection
-- device01 vs device02 comparison
-- device_fault status check
+- Range validation (OUT_OF_RANGE)
+- Rapid change detection vs. the previous valid sample (RAPID_CHANGE)
+- Stuck sensor detection (STUCK_SENSOR)
+- Device fault status check (DEVICE_FAULT)
+- device01 vs device02 comparison (INDOOR_MISMATCH)
+- Missing data detection (MISSING_DATA — separate scheduler, see below)
 
 ### Step 4. AI-based Anomaly Analysis (Optional)
 Unsupervised anomaly scoring model (e.g., Isolation Forest) calculates anomaly scores.
@@ -267,45 +357,66 @@ The converted payload is transmitted to the server over MQTT.
 
 ### 1st Stage: Rule-based Detection
 
-#### Missing Data
-- sensor data missing for a predefined period
-- repeated identical timestamp
+All thresholds below live in `rule_config.yaml`, not hardcoded in Python —
+see `anomaly_rules.py`'s `RANGES`/`RAPID_CHANGE`/`CROSS_CHECK`/
+`STUCK_COUNT`/`MISSING_TIMEOUT*` module-level constants, all loaded from
+that file at import time.
 
-#### Out-of-Range Detection
+#### Missing Data (MISSING_DATA)
+Flags a device if it hasn't produced a **successful** reading
+(`device_fault = "false"`) within `missing_data.timeout_multiplier` ×
+`poll_interval_seconds` (`rule_config.yaml` / `modbus_config.yaml`) — at
+the shipped values, 2 × 600s = 1200s (20 min). Timed from the last
+successful reading, not merely the last polling attempt: a device that is
+continuously Modbus-faulting (producing a `device_fault = "true"` payload
+every single cycle) is still correctly flagged as missing valid data,
+including a device that has never once succeeded. Checked on a 30s
+scheduler (`collector.py`'s `_missing_data_loop`), independent of the
+poll interval itself.
 
-Example baseline:
+#### Out-of-Range Detection (OUT_OF_RANGE)
 
-temperature  
--20 ~ 60
+Configured range per field (`rule_config.yaml`'s `ranges`):
 
-humidity  
-0 ~ 100
+| Field | Range |
+|-------|-------|
+| temperature | -40 ~ 80 °C |
+| humidity | 0 ~ 100 % |
+| co2 | 0 ~ 5000 ppm |
+| wind_speed | 0 ~ 40 m/s |
+| wind_direction | 0 ~ 360° |
+| solar_radiation | 0 ~ 1800 W/m² |
+| rainfall | >= 0 (must not be negative) |
+| pressure | 80 ~ 110 kPa *(suggested default — not independently verified against real local conditions; tune before relying on it)* |
 
-co2  
-0 ~ 5000
+#### Rapid Change Detection (RAPID_CHANGE)
+Detects an unrealistic change vs. the previous *valid* sample
+(`rule_config.yaml`'s `rapid_change`) in: temperature, humidity, co2,
+wind_speed, solar_radiation, rainfall, pressure. `wind_direction` is
+deliberately excluded — plain subtraction breaks at the 0/360 wraparound
+(359° → 1° is a 2° change, not 358°); add a proper circular-distance check
+before including it here.
 
-wind_speed  
->= 0
+#### Stuck Sensor Detection (STUCK_SENSOR)
+Flags a field if the exact same value repeats for
+`stuck_sensor.consecutive_count` (default 5) consecutive *valid* readings
+in a row — a count, not a duration, so it scales with
+`poll_interval_seconds` the same way `missing_data.timeout_multiplier`
+does. Deliberately scoped to temperature/humidity/co2 only (see
+`anomaly_rules.py`'s `STUCK_FIELDS`) — fields like `rain_detected=false`,
+`rainfall=0`, `wind_speed=0`, or `solar_radiation=0` overnight are the
+normal, expected state for long stretches and would false-positive
+constantly if checked here. A failed/omitted reading doesn't count as a
+"repeat" — it's skipped, not treated as breaking or extending the streak.
 
-solar_radiation  
->= 0
-
-#### Sudden Change Detection
-Detect rapid changes in:
-- temperature
-- humidity
-- co2
-- wind_speed
-- solar_radiation
-
-#### Cross-check Between Indoor Nodes
+#### Cross-check Between Indoor Nodes (INDOOR_MISMATCH)
 Compare device01 and device02:
 - temperature difference
 - humidity difference
 - co2 difference
 
-#### Device Status
-- `device_fault == true` (set when a Modbus poll fails after all retries — timeout or CRC error)
+#### Device Status (DEVICE_FAULT)
+- `device_fault == "true"` (set when a Modbus poll fails after all retries — timeout or CRC error)
 
 ### 2nd Stage: AI-based Detection
 AI-based anomaly score using models such as Isolation Forest.
@@ -373,9 +484,9 @@ testBed02 / device03
 
 ## TODO
 - [x] implement Raspberry Pi Modbus RTU collector
-- [ ] implement data validation module
-- [ ] define rule-based anomaly detection thresholds
-- [ ] implement AI anomaly scoring module
+- [x] implement data validation module
+- [x] define rule-based anomaly detection thresholds
+- [x] implement AI anomaly scoring module
 - [x] finalize oneM2M payload format
 - [x] implement server upload interface
 - [x] register systemd service

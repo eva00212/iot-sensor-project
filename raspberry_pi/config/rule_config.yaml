@@ -1,21 +1,60 @@
+# Physical validation ranges. wind_direction/pressure are suggested
+# defaults (not part of the original spec) -- verify against real local
+# conditions before relying on them in production.
 ranges:
-  temperature:     { min: -20,  max: 60   }
+  temperature:     { min: -40,  max: 80   }
   humidity:        { min: 0,    max: 100  }
   co2:             { min: 0,    max: 5000 }
-  wind_speed:      { min: 0,    max: null }
-  solar_radiation: { min: 0,    max: null }
+  wind_speed:      { min: 0,    max: 40   }
+  solar_radiation: { min: 0,    max: 1800 }
+  rainfall:        { min: 0,    max: null }   # must not be negative
+  wind_direction:  { min: 0,    max: 360  }   # compass bearing
+  pressure:        { min: 80,   max: 110  }   # kPa -- suggested default, tune against real local readings
 
-sudden_change:
+# Unrealistic change vs. the previous *valid* sample (RAPID_CHANGE flag).
+# wind_direction is deliberately excluded: naive subtraction breaks at the
+# 0/360 wraparound (359 -> 1 is a 2-degree change, not 358), and a correct
+# circular-distance check wasn't part of the spec -- add one before
+# including it here rather than shipping a check that misfires constantly.
+rapid_change:
   temperature:     5.0    # °C per interval
   humidity:        10.0   # % per interval
   co2:             300.0  # ppm per interval
   wind_speed:      10.0   # m/s per interval
   solar_radiation: 300.0  # W/m² per interval
+  rainfall:        20.0   # mm per interval -- suggested default
+  pressure:        5.0    # kPa per interval -- suggested default
 
 indoor_cross_check:
   temperature: 2.5    # max allowed difference between device01 and device02
   humidity:    8.0
   co2:         200.0
 
+# STUCK_SENSOR: flag a field if the exact same value repeats for this many
+# consecutive *valid* readings in a row. Deliberately scoped to
+# temperature/humidity/co2 only (see anomaly_rules.py's STUCK_FIELDS) --
+# fields like rain_detected=false, rainfall=0, wind_speed=0, or
+# solar_radiation=0 overnight are the normal, expected state for long
+# stretches and would false-positive constantly if checked here.
+stuck_sensor:
+  # A count, not a duration, so it scales naturally with
+  # poll_interval_seconds -- N consecutive readings represents
+  # N x poll_interval_seconds of real elapsed time, same pattern as
+  # missing_data.timeout_multiplier below.
+  consecutive_count: 5
+
 missing_data:
-  timeout_seconds: 60   # flag if no message received within this period
+  # Flag a device if no *successful* reading (device_fault = "false") has
+  # been received within this many poll intervals' worth of time
+  # (poll_interval_seconds, in modbus_config.yaml). Timed from the last
+  # successful reading, not merely the last polling attempt -- a device
+  # that's continuously faulting (but still producing device_fault="true"
+  # payloads every cycle) is still correctly flagged as missing valid
+  # data, not treated as "present" just because it's transmitting.
+  #
+  # At poll_interval_seconds: 600 (production), timeout_multiplier: 2
+  # gives a 1200s (20 min) effective timeout -- within the 900-1200s
+  # target range. At poll_interval_seconds: 10 (dev/test), the same
+  # multiplier gives 20s, so the check still exercises correctly without
+  # a 20-minute wait.
+  timeout_multiplier: 2

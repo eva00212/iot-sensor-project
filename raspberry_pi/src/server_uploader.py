@@ -52,6 +52,14 @@ PUBLISH_TIMEOUT_SECONDS = _server.get("publish_timeout_seconds", 5)
 FLUSH_BATCH_SIZE     = _flush.get("batch_size", 20)
 FLUSH_PACING_SECONDS = _flush.get("pacing_seconds", 1)
 
+# Caps how large logs/buffer.jsonl can grow during a very long outage.
+# Without this, an extended LTE outage would let the buffer file grow
+# without bound, indefinitely consuming disk space. Once full, the oldest
+# queued payload(s) are dropped to make room for the newest -- keeping
+# the most recent state is more useful during a long-running incident
+# than preserving the very earliest queued readings.
+MAX_BUFFERED_MESSAGES = _flush.get("max_buffered_messages", 10000)
+
 # ── Buffer ────────────────────────────────────────────────────────────────────
 BUFFER_PATH  = Path(__file__).parent.parent / "logs" / "buffer.jsonl"
 _buffer_lock = threading.Lock()
@@ -105,8 +113,18 @@ def stop() -> None:
 
 def _write_to_buffer(converted: dict) -> None:
     with _buffer_lock:
-        with open(BUFFER_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(converted) + "\n")
+        lines = BUFFER_PATH.read_text(encoding="utf-8").splitlines() if BUFFER_PATH.exists() else []
+        lines.append(json.dumps(converted))
+
+        if len(lines) > MAX_BUFFERED_MESSAGES:
+            dropped = len(lines) - MAX_BUFFERED_MESSAGES
+            lines = lines[dropped:]
+            logger.error(
+                "Buffer exceeded %d queued message(s); dropped %d oldest to stay bounded.",
+                MAX_BUFFERED_MESSAGES, dropped,
+            )
+
+        BUFFER_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.warning("Payload queued to %s (LTE link unavailable or publish unconfirmed)", BUFFER_PATH)
 
 
