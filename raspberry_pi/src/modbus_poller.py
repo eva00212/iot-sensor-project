@@ -23,7 +23,8 @@ SN-*-FSXCS-N01) that exposes many measurements in one continuous register
 table (500-515); each physical unit only has the sensors installed that
 are relevant to its deployment:
   device01/device02 (indoor, "CO2 variant"): humidity/temperature/CO2
-  device03 (outdoor): wind speed/humidity/temperature/rainfall/solar
+  device03 (outdoor): wind speed/direction/humidity/temperature/rainfall/
+    pressure/solar radiation
 Every variant shares the same 16-register table, so every device is
 polled with the exact same single block read (function code 0x03,
 registers 500-515) -- the payload builder then extracts only the fields
@@ -35,8 +36,15 @@ block read. This is a resilience feature for the always-on collector
 service on top of the verified communication layer -- the reference
 rs485_weather_station.py script itself has no retries and simply reports
 a failed read on its next scheduled poll. Exhausting all retries is
-reported to the caller as (None, error_message), never raised: giving up
-on one reading must never stop the collector.
+reported to the caller as (None, error_message, attempts), never raised:
+giving up on one reading must never stop the collector.
+
+On failure, no fallback/placeholder values (e.g. 0.0) are fabricated for
+the missing measurements -- fields that couldn't be read are omitted from
+the payload entirely, alongside device_fault = "true", error_message, and
+retry_count. A zeroed-out reading would be indistinguishable from a real
+measurement of zero to anything downstream; omitting the field entirely
+is the only way to make "we don't know" not look like "we measured this."
 """
 
 import logging
@@ -80,18 +88,22 @@ SLAVE_DEVICE03 = 3
 FIRST_REGISTER = 500
 REGISTER_COUNT = 16  # covers 500..515 inclusive
 
-REG_WIND_SPEED  = 500  # raw × 0.1 m/s
-REG_HUMIDITY    = 504  # raw × 0.1 %RH
-REG_TEMPERATURE = 505  # signed 16-bit (two's complement), raw × 0.1 °C
-REG_CO2         = 507  # raw integer, ppm (CO2 variant only)
-REG_RAINFALL    = 513  # raw × 0.1 mm (internal only — derives rain_detected)
-REG_SOLAR       = 515  # raw value, W/m²
+REG_WIND_SPEED     = 500  # raw × 0.1 m/s
+REG_WIND_DIRECTION = 503  # raw = compass bearing, degrees (0-360)
+REG_HUMIDITY       = 504  # raw × 0.1 %RH
+REG_TEMPERATURE    = 505  # signed 16-bit (two's complement), raw × 0.1 °C
+REG_CO2            = 507  # raw integer, ppm (CO2 variant only)
+REG_PRESSURE       = 509  # raw × 0.1 kPa
+REG_RAINFALL       = 513  # raw × 0.1 mm
+REG_SOLAR          = 515  # raw value, W/m²
 
-WIND_SPEED_SCALE  = 0.1
-HUMIDITY_SCALE    = 0.1
-TEMPERATURE_SCALE = 0.1
-RAINFALL_SCALE    = 0.1
-SOLAR_SCALE       = 1.0
+WIND_SPEED_SCALE     = 0.1
+WIND_DIRECTION_SCALE = 1.0
+HUMIDITY_SCALE       = 0.1
+TEMPERATURE_SCALE    = 0.1
+PRESSURE_SCALE       = 0.1
+RAINFALL_SCALE       = 0.1
+SOLAR_SCALE          = 1.0
 
 
 class ModbusError(Exception):
@@ -195,13 +207,16 @@ def _read_registers_once(slave_addr: int, start_addr: int, quantity: int) -> lis
     return [struct.unpack(">H", data[i:i + 2])[0] for i in range(0, len(data), 2)]
 
 
-def _read_block(slave_addr: int) -> tuple[list[int] | None, str | None]:
+def _read_block(slave_addr: int) -> tuple[list[int] | None, str | None, int]:
     """
     Reads the full 16-register block (500-515) from `slave_addr`, retrying
     up to MAX_RETRIES times with RETRY_DELAY_SEC between attempts. Returns
-    (registers, None) on success, or (None, error_message) if every
-    attempt failed -- this function never raises for a communication
-    failure, only for a programming error.
+    (registers, None, attempts) on success, or (None, error_message,
+    attempts) if every attempt failed -- this function never raises for a
+    communication failure, only for a programming error. `attempts` is the
+    number of Modbus transactions actually made (1 if the first attempt
+    succeeded, up to MAX_RETRIES if every attempt failed), surfaced to the
+    caller as retry_count.
 
     Serial port acquisition (which opens the port on first use) is inside
     the retry loop, not just the read itself: right after boot the UART
@@ -215,7 +230,7 @@ def _read_block(slave_addr: int) -> tuple[list[int] | None, str | None]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             values = _read_registers_once(slave_addr, FIRST_REGISTER, REGISTER_COUNT)
-            return values, None
+            return values, None, attempt
         except (ModbusError, serial.SerialException, OSError) as e:
             last_error = e
             logger.warning(
@@ -227,7 +242,7 @@ def _read_block(slave_addr: int) -> tuple[list[int] | None, str | None]:
 
     message = f"slave 0x{slave_addr:02X}: {type(last_error).__name__}: {last_error}"
     logger.error("[Modbus] %s (failed after %d attempts)", message, MAX_RETRIES)
-    return None, message
+    return None, message, MAX_RETRIES
 
 
 def _to_signed16(value: int) -> int:
@@ -248,8 +263,12 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls an indoor sensor (device01/device02); returns a payload dict
     ready for data_validator.validate(). One block read of the full
     500-515 register range -- all fields come from the same transaction,
-    so a failure means the whole reading falls back, not per-field."""
-    regs, error = _read_block(slave_addr)
+    so a failure means the whole reading falls back, not per-field.
+
+    On failure, temperature/humidity/co2 are omitted entirely rather than
+    reported as 0.0/0 -- a fabricated zero reading would be
+    indistinguishable from a real measurement to anything downstream."""
+    regs, error, attempts = _read_block(slave_addr)
 
     payload = {
         "site_id":   site_id,
@@ -263,10 +282,9 @@ def poll_indoor(site_id: str, device_id: str, slave_addr: int) -> dict:
         payload["co2"]          = _extract(regs, REG_CO2)
         payload["device_fault"] = "false"
     else:
-        payload["temperature"]   = 0.0
-        payload["humidity"]      = 0.0
         payload["device_fault"]  = "true"
         payload["error_message"] = error
+        payload["retry_count"]   = attempts
 
     return payload
 
@@ -275,8 +293,13 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     """Polls the outdoor sensor (device03); returns a payload dict ready
     for data_validator.validate(). One block read of the full 500-515
     register range -- all fields come from the same transaction, so a
-    failure means the whole reading falls back, not per-field."""
-    regs, error = _read_block(slave_addr)
+    failure means the whole reading falls back, not per-field.
+
+    On failure, all measurement fields (including rain_detected) are
+    omitted entirely rather than reported with a fallback value -- a
+    fabricated "no rain" or 0.0 reading would be indistinguishable from a
+    real measurement to anything downstream."""
+    regs, error, attempts = _read_block(slave_addr)
 
     payload = {
         "site_id":   site_id,
@@ -285,26 +308,25 @@ def poll_outdoor(site_id: str, device_id: str, slave_addr: int) -> dict:
     }
 
     if regs is not None:
-        payload["temperature"] = round(_to_signed16(_extract(regs, REG_TEMPERATURE)) * TEMPERATURE_SCALE, 1)
-        payload["humidity"]    = round(_extract(regs, REG_HUMIDITY) * HUMIDITY_SCALE, 1)
-        payload["wind_speed"]  = round(_extract(regs, REG_WIND_SPEED) * WIND_SPEED_SCALE, 1)
+        payload["temperature"]    = round(_to_signed16(_extract(regs, REG_TEMPERATURE)) * TEMPERATURE_SCALE, 1)
+        payload["humidity"]       = round(_extract(regs, REG_HUMIDITY) * HUMIDITY_SCALE, 1)
+        payload["wind_speed"]     = round(_extract(regs, REG_WIND_SPEED) * WIND_SPEED_SCALE, 1)
+        payload["wind_direction"] = round(_extract(regs, REG_WIND_DIRECTION) * WIND_DIRECTION_SCALE, 1)
 
-        # Register 513 reports a rainfall amount (mm), not a direct
-        # boolean flag. rain_detected is derived: any nonzero rainfall
-        # this interval.
-        rainfall = _extract(regs, REG_RAINFALL) * RAINFALL_SCALE
+        # Register 513 is a rainfall amount (mm); rain_detected is derived
+        # from it (any nonzero rainfall this interval), and the raw amount
+        # is also published directly as rainfall.
+        rainfall = round(_extract(regs, REG_RAINFALL) * RAINFALL_SCALE, 1)
+        payload["rainfall"]      = rainfall
         payload["rain_detected"] = "true" if rainfall > 0.0 else "false"
 
         payload["solar_radiation"] = round(_extract(regs, REG_SOLAR) * SOLAR_SCALE, 1)
+        payload["pressure"]        = round(_extract(regs, REG_PRESSURE) * PRESSURE_SCALE, 1)
         payload["device_fault"]    = "false"
     else:
-        payload["temperature"]   = 0.0
-        payload["humidity"]      = 0.0
-        # rain_detected is a required field, so it always gets a value --
-        # "false" is the safe fallback when the read failed.
-        payload["rain_detected"] = "false"
         payload["device_fault"]  = "true"
         payload["error_message"] = error
+        payload["retry_count"]   = attempts
 
     return payload
 

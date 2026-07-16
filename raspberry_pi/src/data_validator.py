@@ -16,35 +16,47 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 # ── Required fields per device type ──────────────────────────────────────────
+# Only fields that are *always* present, success or failure, are required.
+# temperature/humidity/co2/wind_speed/etc. are all omitted (not zeroed)
+# when a Modbus read fails, so none of them can be required here -- see
+# COMMON_OPTIONAL_FIELDS/DEVICE_OPTIONAL_FIELDS below.
 COMMON_FIELDS = {
     "site_id":      str,
     "device_id":    str,
     "timestamp":    str,
-    "temperature":  (int, float),
-    "humidity":     (int, float),
     "device_fault": str,
 }
 
 DEVICE_EXTRA_FIELDS = {
     "device01": {},
     "device02": {},
-    "device03": {
-        "rain_detected": str,
-    },
+    "device03": {},
 }
 
 # Optional fields validated only when present in the payload, regardless
-# of device_id -- e.g. error_message, set by modbus_poller when a Modbus
-# read exhausts all retries (alongside device_fault = "true").
+# of device_id -- e.g. error_message/retry_count, set by modbus_poller
+# when a Modbus read exhausts all retries (alongside device_fault = "true").
+# temperature/humidity are here (not in COMMON_FIELDS) because every
+# device type has them, but only when the read succeeded.
 COMMON_OPTIONAL_FIELDS = {
+    "temperature":   (int, float),
+    "humidity":      (int, float),
     "error_message": str,
+    "retry_count":   int,
 }
 
 # Optional fields: validated only when present in the payload
 DEVICE_OPTIONAL_FIELDS = {
     "device01": {"co2": (int, float)},
     "device02": {"co2": (int, float)},
-    "device03": {"wind_speed": (int, float), "solar_radiation": (int, float)},
+    "device03": {
+        "wind_speed":     (int, float),
+        "wind_direction": (int, float),
+        "rainfall":       (int, float),
+        "rain_detected":  str,
+        "solar_radiation": (int, float),
+        "pressure":       (int, float),
+    },
 }
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"

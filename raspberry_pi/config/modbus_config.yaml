@@ -38,6 +38,7 @@ inter_poll_delay_ms: 200    # min. gap between successive Modbus reads to
                              # block transaction, so this only applies
                              # between devices, not within one.
 
-# How often to poll all 3 sensors. 10s here for easy dev/testing
-# verification -- switch to 600 (10 minutes) for production.
-poll_interval_seconds: 10
+# How often to poll all 3 sensors. Production value: 600 (10 minutes).
+# For fast dev/testing verification, override to something like 10
+# locally -- do not commit a dev value here.
+poll_interval_seconds: 600

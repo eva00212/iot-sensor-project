@@ -11,6 +11,7 @@ that outbound upload is the only MQTT hop in this system.
 """
 
 import logging
+import logging.handlers
 import threading
 import time
 from pathlib import Path
@@ -23,12 +24,22 @@ import modbus_poller
 LOG_DIR = Path(__file__).parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# A plain FileHandler would grow collector.log forever over months/years
+# of unattended operation. RotatingFileHandler caps it at
+# LOG_MAX_BYTES x (LOG_BACKUP_COUNT + 1) total on disk (collector.log plus
+# up to LOG_BACKUP_COUNT rotated .1/.2/... files), rotating automatically
+# once the active file hits LOG_MAX_BYTES.
+LOG_MAX_BYTES    = 10 * 1024 * 1024  # 10 MB per file
+LOG_BACKUP_COUNT = 5                  # keep 5 rotated files -- 60 MB ceiling total
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(LOG_DIR / "collector.log"),
+        logging.handlers.RotatingFileHandler(
+            LOG_DIR / "collector.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+        ),
     ],
 )
 logger = logging.getLogger(__name__)

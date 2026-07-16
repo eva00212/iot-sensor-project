@@ -29,14 +29,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ── Fields included in the server payload per device ─────────────────────────
-# error_message is only ever present when device_fault = "true" (set by
-# modbus_poller after exhausting all Modbus retries); the dict
-# comprehension in build() below omits it automatically otherwise.
+# error_message/retry_count are only ever present when device_fault =
+# "true" (set by modbus_poller after exhausting all Modbus retries); the
+# dict comprehension in build() below omits any field not in `validated`
+# automatically, so a failed reading naturally drops temperature/humidity/
+# etc. instead of publishing a fabricated 0.0/false measurement.
 SERVER_FIELDS = {
-    "device01": ["temperature", "humidity", "co2", "device_fault", "error_message"],
-    "device02": ["temperature", "humidity", "co2", "device_fault", "error_message"],
-    "device03": ["temperature", "humidity", "wind_speed", "rain_detected",
-                 "solar_radiation", "device_fault", "error_message"],
+    "device01": ["temperature", "humidity", "co2",
+                 "device_fault", "error_message", "retry_count"],
+    "device02": ["temperature", "humidity", "co2",
+                 "device_fault", "error_message", "retry_count"],
+    "device03": ["temperature", "humidity", "wind_speed", "wind_direction",
+                 "rainfall", "rain_detected", "solar_radiation", "pressure",
+                 "device_fault", "error_message", "retry_count"],
 }
 
 # ── Public API ────────────────────────────────────────────────────────────────

@@ -41,17 +41,20 @@ def _build_response(slave_addr: int, values: list[int]) -> bytes:
     return body + struct.pack("<H", crc)
 
 
-def _full_block_registers(wind=14, humidity=654, temperature=251, co2=453, rainfall=0, solar=6536):
+def _full_block_registers(wind=14, wind_dir=180, humidity=654, temperature=251,
+                           co2=453, pressure=1013, rainfall=0, solar=6536):
     """Builds a 16-element register list (indices 0..15 == registers
     500..515) with the given values at their real offsets and zero
     elsewhere, matching what a real 500-515 block read returns."""
     regs = [0] * modbus_poller.REGISTER_COUNT
-    regs[modbus_poller.REG_WIND_SPEED - modbus_poller.FIRST_REGISTER]  = wind & 0xFFFF
-    regs[modbus_poller.REG_HUMIDITY - modbus_poller.FIRST_REGISTER]    = humidity
-    regs[modbus_poller.REG_TEMPERATURE - modbus_poller.FIRST_REGISTER] = temperature & 0xFFFF
-    regs[modbus_poller.REG_CO2 - modbus_poller.FIRST_REGISTER]         = co2
-    regs[modbus_poller.REG_RAINFALL - modbus_poller.FIRST_REGISTER]    = rainfall
-    regs[modbus_poller.REG_SOLAR - modbus_poller.FIRST_REGISTER]       = solar
+    regs[modbus_poller.REG_WIND_SPEED - modbus_poller.FIRST_REGISTER]     = wind & 0xFFFF
+    regs[modbus_poller.REG_WIND_DIRECTION - modbus_poller.FIRST_REGISTER] = wind_dir
+    regs[modbus_poller.REG_HUMIDITY - modbus_poller.FIRST_REGISTER]       = humidity
+    regs[modbus_poller.REG_TEMPERATURE - modbus_poller.FIRST_REGISTER]    = temperature & 0xFFFF
+    regs[modbus_poller.REG_CO2 - modbus_poller.FIRST_REGISTER]            = co2
+    regs[modbus_poller.REG_PRESSURE - modbus_poller.FIRST_REGISTER]       = pressure
+    regs[modbus_poller.REG_RAINFALL - modbus_poller.FIRST_REGISTER]       = rainfall
+    regs[modbus_poller.REG_SOLAR - modbus_poller.FIRST_REGISTER]          = solar
     return regs
 
 
@@ -180,9 +183,10 @@ class TestReadRegistersOnce(unittest.TestCase):
 
 
 class TestReadBlockRetry(unittest.TestCase):
-    """_read_block returns (values, error_message) and sleeps
+    """_read_block returns (values, error_message, attempts) and sleeps
     RETRY_DELAY_SEC between attempts -- time.sleep is mocked throughout so
-    these tests don't actually wait."""
+    these tests don't actually wait. `attempts` is surfaced to callers as
+    retry_count."""
 
     def test_succeeds_after_transient_failures(self):
         regs = _full_block_registers()
@@ -191,12 +195,22 @@ class TestReadBlockRetry(unittest.TestCase):
             side_effect=[modbus_poller.ModbusError("no response"), regs],
         ) as mock_read, \
              patch.object(modbus_poller.time, "sleep") as mock_sleep:
-            values, error = modbus_poller._read_block(1)
+            values, error, attempts = modbus_poller._read_block(1)
 
         self.assertEqual(values, regs)
         self.assertIsNone(error)
+        self.assertEqual(attempts, 2)
         self.assertEqual(mock_read.call_count, 2)
         mock_sleep.assert_called_once_with(modbus_poller.RETRY_DELAY_SEC)
+
+    def test_succeeds_on_first_attempt_reports_one(self):
+        regs = _full_block_registers()
+        with patch.object(modbus_poller, "_read_registers_once", return_value=regs), \
+             patch.object(modbus_poller.time, "sleep") as mock_sleep:
+            values, error, attempts = modbus_poller._read_block(1)
+
+        self.assertEqual(attempts, 1)
+        mock_sleep.assert_not_called()
 
     def test_returns_none_after_exhausting_retries(self):
         with patch.object(
@@ -204,10 +218,11 @@ class TestReadBlockRetry(unittest.TestCase):
             side_effect=modbus_poller.ModbusError("CRC mismatch"),
         ) as mock_read, \
              patch.object(modbus_poller.time, "sleep") as mock_sleep:
-            values, error = modbus_poller._read_block(1)
+            values, error, attempts = modbus_poller._read_block(1)
 
         self.assertIsNone(values)
         self.assertIn("CRC mismatch", error)
+        self.assertEqual(attempts, modbus_poller.MAX_RETRIES)
         self.assertEqual(mock_read.call_count, modbus_poller.MAX_RETRIES)
         # One sleep between each pair of attempts, none after the last.
         self.assertEqual(mock_sleep.call_count, modbus_poller.MAX_RETRIES - 1)
@@ -220,21 +235,23 @@ class TestReadBlockRetry(unittest.TestCase):
             side_effect=[modbus_poller.serial.SerialException("port busy"), regs],
         ) as mock_read, \
              patch.object(modbus_poller.time, "sleep"):
-            values, error = modbus_poller._read_block(1)
+            values, error, attempts = modbus_poller._read_block(1)
 
         self.assertEqual(values, regs)
         self.assertIsNone(error)
+        self.assertEqual(attempts, 2)
         self.assertEqual(mock_read.call_count, 2)
 
 
 class TestPollIndoor(unittest.TestCase):
     """poll_indoor now does exactly one block read (500-515) instead of
     separate per-field reads -- success or failure applies to the whole
-    reading, not per field."""
+    reading, not per field. On failure, no fields are fabricated: no
+    temperature/humidity/co2 at all, not even 0.0."""
 
     def test_success(self):
         regs = _full_block_registers(humidity=654, temperature=251, co2=453)
-        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None, 1)):
             payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
 
         self.assertEqual(payload["site_id"], "testBed01")
@@ -244,27 +261,30 @@ class TestPollIndoor(unittest.TestCase):
         self.assertEqual(payload["co2"], 453)
         self.assertEqual(payload["device_fault"], "false")
         self.assertNotIn("error_message", payload)
+        self.assertNotIn("retry_count", payload)
         self.assertIn("timestamp", payload)
 
     def test_negative_temperature(self):
         regs = _full_block_registers(temperature=0xFF9C)
-        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None, 1)):
             payload = modbus_poller.poll_indoor("testBed01", "device02", 2)
 
         self.assertEqual(payload["temperature"], -10.0)
 
-    def test_read_failure_falls_back_and_reports_error(self):
-        with patch.object(modbus_poller, "_read_block", return_value=(None, "no response from slave")):
+    def test_read_failure_omits_all_measurements_and_reports_error(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(None, "no response from slave", 10)):
             payload = modbus_poller.poll_indoor("testBed01", "device01", 1)
 
-        self.assertEqual(payload["temperature"], 0.0)
-        self.assertEqual(payload["humidity"], 0.0)
+        # No fabricated values -- these must be entirely absent, not 0.0/0.
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("humidity", payload)
         self.assertNotIn("co2", payload)
         self.assertEqual(payload["device_fault"], "true")
         self.assertEqual(payload["error_message"], "no response from slave")
+        self.assertEqual(payload["retry_count"], 10)
 
     def test_reads_full_block_starting_at_first_register(self):
-        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None)) as mock_read:
+        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None, 1)) as mock_read:
             modbus_poller.poll_indoor("testBed01", "device01", 1)
 
         mock_read.assert_called_once_with(1)
@@ -273,42 +293,56 @@ class TestPollIndoor(unittest.TestCase):
 class TestPollOutdoor(unittest.TestCase):
     """poll_outdoor now does exactly one block read (500-515) instead of
     four separate reads -- success or failure applies to the whole
-    reading, not per field."""
+    reading, not per field. On failure, no fields (including
+    rain_detected) are fabricated."""
 
     def test_success_no_rain(self):
-        regs = _full_block_registers(wind=14, humidity=614, temperature=238, rainfall=0, solar=6536)
-        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
+        regs = _full_block_registers(wind=14, wind_dir=270, humidity=614, temperature=238,
+                                      pressure=1013, rainfall=0, solar=6536)
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None, 1)):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         self.assertEqual(payload["wind_speed"], 1.4)
+        self.assertEqual(payload["wind_direction"], 270.0)
         self.assertEqual(payload["humidity"], 61.4)
         self.assertEqual(payload["temperature"], 23.8)
+        self.assertEqual(payload["pressure"], 101.3)
+        self.assertEqual(payload["rainfall"], 0.0)
         self.assertEqual(payload["solar_radiation"], 6536.0)
         self.assertEqual(payload["rain_detected"], "false")
         self.assertEqual(payload["device_fault"], "false")
         self.assertNotIn("error_message", payload)
+        self.assertNotIn("retry_count", payload)
+        self.assertNotIn("co2", payload)  # device03 never publishes co2
 
     def test_success_with_rain(self):
         regs = _full_block_registers(rainfall=5)
-        with patch.object(modbus_poller, "_read_block", return_value=(regs, None)):
+        with patch.object(modbus_poller, "_read_block", return_value=(regs, None, 1)):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
+        self.assertEqual(payload["rainfall"], 0.5)
         self.assertEqual(payload["rain_detected"], "true")
 
-    def test_read_failure_falls_back_and_reports_error(self):
-        with patch.object(modbus_poller, "_read_block", return_value=(None, "CRC mismatch")):
+    def test_read_failure_omits_all_measurements_and_reports_error(self):
+        with patch.object(modbus_poller, "_read_block", return_value=(None, "CRC mismatch", 10)):
             payload = modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         self.assertEqual(payload["device_fault"], "true")
-        self.assertEqual(payload["temperature"], 0.0)
-        self.assertEqual(payload["humidity"], 0.0)
-        self.assertEqual(payload["rain_detected"], "false")
-        self.assertNotIn("wind_speed", payload)
-        self.assertNotIn("solar_radiation", payload)
         self.assertEqual(payload["error_message"], "CRC mismatch")
+        self.assertEqual(payload["retry_count"], 10)
+        # No fabricated values -- these must be entirely absent, not
+        # 0.0/"false" fallbacks (rain_detected included).
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("humidity", payload)
+        self.assertNotIn("wind_speed", payload)
+        self.assertNotIn("wind_direction", payload)
+        self.assertNotIn("rainfall", payload)
+        self.assertNotIn("rain_detected", payload)
+        self.assertNotIn("solar_radiation", payload)
+        self.assertNotIn("pressure", payload)
 
     def test_reads_full_block_starting_at_first_register(self):
-        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None)) as mock_read:
+        with patch.object(modbus_poller, "_read_block", return_value=(_full_block_registers(), None, 1)) as mock_read:
             modbus_poller.poll_outdoor("testBed01", "device03", 3)
 
         mock_read.assert_called_once_with(3)
