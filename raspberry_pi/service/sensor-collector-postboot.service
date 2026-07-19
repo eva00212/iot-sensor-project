@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartFarm one-time post-reboot verification (__UNIT_NAME__)
+# Runs once after the reboot that install.sh triggers to apply a UART
+# config change, then disables itself — see install.sh step 7.
+After=sensor-collector.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__WORKDIR__
+ExecStart=__VERIFY_CMD__
+ExecStartPost=/bin/systemctl disable __UNIT_NAME__.service
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

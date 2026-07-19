@@ -27,14 +27,16 @@ iot-sensor-project/
 │   │   └── simulator.py          # feeds synthetic readings into the pipeline, no hardware needed
 │   │
 │   ├── config/
-│   │   ├── site_config.yaml           # this Pi's site_id + server upload settings (gitignored, real secrets)
-│   │   ├── site_config.example.yaml   # safe template — copy to site_config.yaml and edit
+│   │   ├── site_config.yaml           # this Pi's site_id + server upload settings (gitignored, real secrets; written by install.sh)
+│   │   ├── site_config.example.yaml   # safe template — install.sh copies this to site_config.yaml and stamps site_id automatically
 │   │   ├── modbus_config.yaml         # RS485 serial port + polling settings
 │   │   └── rule_config.yaml           # anomaly rule configuration
 │   │
 │   ├── tests/                    # unit tests (modbus_poller parsing/CRC logic)
 │   ├── logs/                     # runtime logs
-│   └── service/                  # systemd service files
+│   ├── install.sh                # one-command field deployment (see Deployment section below)
+│   ├── verify_install.sh         # post-install health check, run automatically by install.sh
+│   └── service/                  # systemd unit templates (sensor-collector, sensor-collector-postboot)
 │
 └── docs/                         # system documentation
 ```
@@ -54,8 +56,50 @@ iot-sensor-project/
 - The server must always be addressed by hostname, never a hardcoded IP or network interface — LTE connections are NAT'd and the Pi's own address can change
 - oneM2M formatting will be finalized after server-side agreement
 
+## Deployment (Field Installation)
+GitHub clone + `install.sh` is the primary deployment method for a new test
+bed — not SD card cloning. Cloning a golden SD image was the original
+approach but is too slow for field rollout; a fresh Raspberry Pi OS
+(Bookworm/Trixie) install now only needs:
+
+Targets Raspberry Pi 5 hardware specifically. The Pi 5's UART sits behind
+the RP1 I/O controller rather than the SoC directly, so its `config.txt`
+syntax (`dtparam=uart0`) differs from earlier boards (`enable_uart=1`) —
+`install.sh` never hand-edits that file, it always goes through
+`raspi-config nonint`, which already branches on board model internally.
+Both `install.sh` and `verify_install.sh` also check
+`/proc/device-tree/model` and warn (non-fatally) if run on anything other
+than a Pi 5.
+
+```bash
+git clone <repo-url>
+cd iot-sensor-project/raspberry_pi
+./install.sh testBed06
+```
+
+`install.sh <site_id>`:
+- installs required apt packages (`python3-venv`, `python3-pip`, `raspi-config`)
+- creates/updates the `.venv` virtualenv and installs `requirements.txt`
+- enables the UART for RS485 access via `raspi-config nonint` (reboots
+  automatically, only on first run, if this actually changes anything)
+- writes `site_id` into `config/site_config.yaml` (creating it from
+  `site_config.example.yaml` if needed) and sets the hostname to match
+- regenerates `/etc/machine-id` and the SSH host keys on first run only,
+  so devices provisioned from a common image/script don't collide on the
+  network
+- installs, enables, and (re)starts the `sensor-collector` systemd service
+- runs `verify_install.sh` automatically at the end (directly, or via the
+  self-disabling `sensor-collector-postboot` unit if a reboot was needed)
+
+It is idempotent — re-running it (e.g. after `git pull`, or to change
+`site_id`) updates the install in place without breaking a running
+deployment. `verify_install.sh [site_id]` can also be run by hand at any
+time to check the health of an existing install.
+
 ## Commands
-- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies
+- `raspberry_pi/install.sh <site_id>` - full field deployment on a fresh Pi (see above)
+- `raspberry_pi/verify_install.sh [site_id]` - check an existing install's health
+- `pip install -r raspberry_pi/requirements.txt` - install Raspberry Pi dependencies (manual/dev use)
 - `python src/collector.py` - run the sensor collector (polls RS485, runs the pipeline)
 - `python src/simulator.py` - exercise the pipeline with synthetic readings, no hardware needed
 - `systemctl start sensor-collector` - start service
